@@ -34,7 +34,7 @@ extern "C" HRESULT WINAPI D3D11CreateDevice(IDXGIAdapter*, D3D_DRIVER_TYPE, HMOD
 extern "C" HRESULT WINAPI CreateDXGIFactory1(REFIID, void**);
 
 namespace {
-enum { NK_GENERIC = 1, NK_CLEAR_DSV, NK_SET_MINLOD, NK_GET_MINLOD, NK_PRESENT, NK_PRESENT1, NK_CREATE_SC, NK_CREATE_SC_HWND, NK_RESIZE_BUFFERS, NK_DESC_FIRST = 16,
+enum { NK_GENERIC = 1, NK_CLEAR_DSV, NK_SET_MINLOD, NK_GET_MINLOD, NK_PRESENT, NK_PRESENT1, NK_CREATE_SC, NK_CREATE_SC_HWND, NK_RESIZE_BUFFERS, NK_REG4, NK_REG8, NK_DESC_FIRST = 16,
        NK_TR_MAP = 40, NK_TR_UPD, NK_TR_UPD1, NK_TR_DI, NK_TR_D, NK_TR_DII, NK_TR_DIN, NK_TEX2D, NK_TEX1D, NK_TEX3D, NK_BUF };
 enum { D_ADAPTER, D_ADAPTER1, D_ADAPTER2, D_ADAPTER3, D_OUTPUT, D_OUTPUT1 };
 
@@ -445,6 +445,46 @@ extern "C" int hp_native_classify(void* self, uint64_t fn) {
     if ((k = probe<IDXGISwapChain>(self, fn, swap, 3))) return k;
     if ((k = probe<IDXGIFactory2>(self, fn, factory, 2))) return k;
     if ((k = probe<IDXGIFactory>(self, fn, factory, 1))) return k;
+    // Fast register-only dispatch for hot ID3D11DeviceContext1 methods (avoids 10 guest stack reads/call)
+    static const Slot ctx_fast[] = {
+        { vidx(&ID3D11DeviceContext::VSSetConstantBuffers), NK_REG4 },
+        { vidx(&ID3D11DeviceContext::PSSetShaderResources), NK_REG4 },
+        { vidx(&ID3D11DeviceContext::PSSetShader), NK_REG4 },
+        { vidx(&ID3D11DeviceContext::PSSetSamplers), NK_REG4 },
+        { vidx(&ID3D11DeviceContext::VSSetShader), NK_REG4 },
+        { vidx(&ID3D11DeviceContext::DrawIndexed), NK_REG4 },
+        { vidx(&ID3D11DeviceContext::Draw), NK_REG4 },
+        { vidx(&ID3D11DeviceContext::Unmap), NK_REG4 },
+        { vidx(&ID3D11DeviceContext::PSSetConstantBuffers), NK_REG4 },
+        { vidx(&ID3D11DeviceContext::IASetInputLayout), NK_REG4 },
+        { vidx(&ID3D11DeviceContext::IASetIndexBuffer), NK_REG4 },
+        { vidx(&ID3D11DeviceContext::GSSetConstantBuffers), NK_REG4 },
+        { vidx(&ID3D11DeviceContext::GSSetShader), NK_REG4 },
+        { vidx(&ID3D11DeviceContext::IASetPrimitiveTopology), NK_REG4 },
+        { vidx(&ID3D11DeviceContext::VSSetShaderResources), NK_REG4 },
+        { vidx(&ID3D11DeviceContext::VSSetSamplers), NK_REG4 },
+        { vidx(&ID3D11DeviceContext::OMSetRenderTargets), NK_REG4 },
+        { vidx(&ID3D11DeviceContext::OMSetBlendState), NK_REG4 },
+        { vidx(&ID3D11DeviceContext::OMSetDepthStencilState), NK_REG4 },
+        { vidx(&ID3D11DeviceContext::RSSetState), NK_REG4 },
+        { vidx(&ID3D11DeviceContext::RSSetViewports), NK_REG4 },
+        { vidx(&ID3D11DeviceContext::RSSetScissorRects), NK_REG4 },
+        { vidx(&ID3D11DeviceContext::ClearRenderTargetView), NK_REG4 },
+        { vidx(&ID3D11DeviceContext::CopyResource), NK_REG4 },
+        { vidx(&ID3D11DeviceContext::Dispatch), NK_REG4 },
+        { vidx(&ID3D11DeviceContext::Flush), NK_REG4 },
+        { vidx(&ID3D11DeviceContext::CSSetShader), NK_REG4 },
+        { vidx(&ID3D11DeviceContext::CSSetShaderResources), NK_REG4 },
+        { vidx(&ID3D11DeviceContext::CSSetConstantBuffers), NK_REG4 },
+        { vidx(&ID3D11DeviceContext::Map), NK_REG8 },
+        { vidx(&ID3D11DeviceContext::IASetVertexBuffers), NK_REG8 },
+        { vidx(&ID3D11DeviceContext::DrawIndexedInstanced), NK_REG8 },
+        { vidx(&ID3D11DeviceContext::DrawInstanced), NK_REG8 },
+        { vidx(&ID3D11DeviceContext::UpdateSubresource), NK_REG8 },
+        { vidx(&ID3D11DeviceContext1::VSSetConstantBuffers1), NK_REG8 },
+        { vidx(&ID3D11DeviceContext1::PSSetConstantBuffers1), NK_REG8 },
+    };
+    if ((k = probe<ID3D11DeviceContext1>(self, fn, ctx_fast, (int)(sizeof ctx_fast / sizeof ctx_fast[0])))) return k;
     return NK_GENERIC;
 }
 
@@ -526,6 +566,8 @@ static uint64_t mono_us() {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return (uint64_t)t.tv_sec * 1000000ull + (uint64_t)t.tv_nsec / 1000ull;
 }
+extern "C" uint32_t g_w64_com_calls;
+extern "C" uint32_t g_w64_tramp_calls;
 extern "C" int32_t hp_native_present(int kind, void* self, uint64_t fn, uint32_t sync, uint32_t flags, const void* params) {
     static int sync_ovr = -2;
     if (sync_ovr == -2) { const char* e = getenv("HP_SYNC_INTERVAL"); sync_ovr = e && *e ? atoi(e) : -1; }
@@ -545,10 +587,11 @@ extern "C" int32_t hp_native_present(int kind, void* self, uint64_t fn, uint32_t
     __atomic_store_n(&g_frame, n, __ATOMIC_RELAXED);
     if (st && !(flags & DXGI_PRESENT_TEST)) {
         static uint64_t prev_t = 0;
-        static float dts[150];
+        static float dts[150], prs[150];
         static int dti = 0;
         static uint32_t bkt[6], w_gp_n, w_cp_n, w_sp_n;
         static uint64_t w_gp_us, w_cp_us, w_sp_us;
+        static double pr_sum = 0.0;
         uint32_t gp_n = g_st_gp_n.exchange(0, std::memory_order_relaxed);
         uint64_t gp_us = g_st_gp_us.exchange(0, std::memory_order_relaxed);
         uint32_t cp_n = g_st_cp_n.exchange(0, std::memory_order_relaxed);
@@ -567,13 +610,20 @@ extern "C" int32_t hp_native_present(int kind, void* self, uint64_t fn, uint32_t
                     w64_log("[spike] f%lu dt=%.1fms pres=%.1fms sync=%u | gp=%u(%.1fms) cp=%u(%.1fms) susp=%u(%.1fms)",
                             n, dt, pr, sync, gp_n, gp_us / 1000.0, cp_n, cp_us / 1000.0, sp_n, sp_us / 1000.0);
             }
-            dts[dti++] = dt;
+            dts[dti] = dt;
+            prs[dti] = pr;
+            pr_sum += pr;
+            dti++;
             if (dti == 150) {
                 std::sort(dts, dts + 150);
-                w64_log("[stutter] 150f sync=%u p50=%.1f p95=%.1f p99=%.1f max=%.1f ms | <20:%u 20-30:%u 30-45:%u 45-80:%u 80-150:%u >150:%u | gp=%u(%.0fms) cp=%u(%.0fms) susp=%u(%.0fms)",
-                        sync, dts[75], dts[142], dts[148], dts[149], bkt[0], bkt[1], bkt[2], bkt[3], bkt[4], bkt[5],
+                std::sort(prs, prs + 150);
+                uint32_t com_n = __atomic_exchange_n(&g_w64_com_calls, 0, __ATOMIC_RELAXED);
+                uint32_t tr_n = __atomic_exchange_n(&g_w64_tramp_calls, 0, __ATOMIC_RELAXED);
+                w64_log("[stutter] 150f sync=%u p50=%.1f p95=%.1f p99=%.1f max=%.1f ms (pres p50=%.1f avg=%.1f) | com=%u/f tramp=%u/f | <20:%u 20-30:%u 30-45:%u 45-80:%u 80-150:%u >150:%u | gp=%u(%.0fms) cp=%u(%.0fms) susp=%u(%.0fms)",
+                        sync, dts[75], dts[142], dts[148], dts[149], prs[75], pr_sum / 150.0, com_n / 150u, tr_n / 150u,
+                        bkt[0], bkt[1], bkt[2], bkt[3], bkt[4], bkt[5],
                         w_gp_n, w_gp_us / 1000.0, w_cp_n, w_cp_us / 1000.0, w_sp_n, w_sp_us / 1000.0);
-                dti = 0; std::memset(bkt, 0, sizeof bkt);
+                dti = 0; pr_sum = 0.0; std::memset(bkt, 0, sizeof bkt);
                 w_gp_n = w_cp_n = w_sp_n = 0; w_gp_us = w_cp_us = w_sp_us = 0;
             }
         }

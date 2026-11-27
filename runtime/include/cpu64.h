@@ -265,7 +265,13 @@ void w64_todo(uint64_t va, const char *text);
  * a host with a conflicting reservation loads it elsewhere, and then every
  * RIP-relative address the lifter resolved statically needs the same shift. */
 extern int64_t g_image_delta;   /* live_base - PE ImageBase */
+#ifdef W64_DYNAMIC_GVA
 #define GVA(abs) ((uint64_t)((int64_t)(abs) + g_image_delta))
+#else
+/* Runtime maps every PE at its exact lift base (g_image_delta is always 0), so
+ * fold GVA to an immediate constant and avoid ~267k GOT loads per image. */
+#define GVA(abs) ((uint64_t)(abs))
+#endif
 
 /* ---- flag helpers ----
  *
@@ -536,16 +542,14 @@ static inline __attribute__((always_inline)) uint64_t op_bsf(CPU *c, uint64_t ol
     bitscan_undef_flags(c);
     if (!v) { c->zf = 1; return old; }
     c->zf = 0;
-    uint64_t i = 0; while (!((v >> i) & 1)) i++;
-    return i;
+    return (uint64_t)__builtin_ctzll(v);
 }
 static inline __attribute__((always_inline)) uint64_t op_bsr(CPU *c, uint64_t old, uint64_t v, int sz) {
     v &= mask_sz(sz);
     bitscan_undef_flags(c);
     if (!v) { c->zf = 1; return old; }
     c->zf = 0;
-    uint64_t i = sz * 8 - 1; while (!((v >> i) & 1)) i--;
-    return i;
+    return (uint64_t)(63 - __builtin_clzll(v));
 }
 
 /* ---- SSE memory operands ----

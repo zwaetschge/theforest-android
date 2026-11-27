@@ -71,7 +71,13 @@ const char *w64_hostfn_name(uint64_t va);
 /* ---- host -> guest calls ---- */
 uint64_t w64_call(CPU *c, uint64_t fn, int n, ...);           /* integer/pointer args */
 uint64_t w64_callv(CPU *c, uint64_t fn, int n, const uint64_t *args, unsigned float_mask);
+uint64_t w64_callv_fn(CPU *c, w64_fn host_fn, uint64_t va, int n, const uint64_t *args, unsigned float_mask);
+w64_fn   w64_lookup_fn(uint64_t va);
 CPU *w64_cpu(void);                  /* this host thread's guest CPU (created on demand) */
+void w64_gc_push_guest_roots(void (*push_fn)(void *lo, void *hi));
+extern uint32_t g_w64_com_calls;
+extern uint32_t g_w64_tramp_calls;
+extern int g_w64_prof_enabled;
 
 /* ---- modules (modules.c) ---- */
 #define W64_MAX_MODULES 16

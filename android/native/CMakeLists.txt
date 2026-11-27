@@ -49,8 +49,8 @@ target_include_directories(main PRIVATE
     ${ROOT}/third_party/mono ${MONO_BUILD}
     ${ROOT}/third_party/mono/eglib/src ${MONO_BUILD}/eglib/src)
 # -fsigned-char: plain char is unsigned on arm64 but signed on the x86 host the runtime is developed on.
-target_compile_options(main PRIVATE $<$<COMPILE_LANGUAGE:C>:-O2 -g -fwrapv -fno-strict-aliasing -ffp-contract=off -fsigned-char -Wno-unused-function>
-    $<$<COMPILE_LANGUAGE:CXX>:-O2 -std=c++17 -w>)
+target_compile_options(main PRIVATE $<$<COMPILE_LANGUAGE:C>:-O3 -march=armv8.2-a -g -fwrapv -fno-strict-aliasing -ffp-contract=off -fsigned-char -Wno-unused-function>
+    $<$<COMPILE_LANGUAGE:CXX>:-O3 -march=armv8.2-a -std=c++17 -w>)
 target_link_libraries(main PRIVATE
     SDL3::SDL3-shared hp_dxvk
     -Wl,--start-group

@@ -20,13 +20,14 @@ Ein nativer Android-Port (`arm64-v8a`) der PC-Version von **The Forest** (Unity 
 
 ## Status
 
-Spielbarer Singleplayer (`0.1.0`). Auf echter Android-Hardware verifiziert: Boot, 3D-Höhlen-Titelbildschirm, NGUI-Menüs, Neues Spiel, `ForestMain_v08`-Open-World-Laden (`7,8 s` Scene Load + `9,8 s` Aktivierung, null Mono-/Astar-Exceptions), Flugzeugabsturz-Intro & Skip, 3D-Wald-Erkundung im Freien, FMOD-Studio-Audio (WASAPI → SDL3), physischer Controller + On-Screen-`PadView`, automatisches Entpacken von ZIP64-Datenpaketen sowie Background/Resume-Lifecycle (gleiche PID, persistenter Adreno-`VkPipelineCache`). Technisches Protokoll: [`port/RECOMP_STATUS.md`](port/RECOMP_STATUS.md).
+Spielbarer Singleplayer (`0.2.0`). Auf echter Android-Hardware verifiziert (**AYN Odin 3** und **Samsung Galaxy Tab S8 Ultra**): Boot, 3D-Höhlen-Titelbildschirm, NGUI-Menüs, Neues Spiel, `ForestMain_v08`-Open-World-Laden (`0` Mono-/Astar-/ItemDatabase-Exceptions), Flugzeugabsturz-Intro & Skip, 3D-Wald-Erkundung im Freien, FMOD-Studio-Audio (WASAPI → SDL3), physischer Controller + On-Screen-`PadView`, automatisches Entpacken von ZIP64-Datenpaketen, automatisches Mobil-Grafik-Preset beim Erststart (`FullRes`-Texturen + `FXAA`) sowie Background/Resume-Lifecycle (gleiche PID, persistenter Adreno-`VkPipelineCache`). Technisches Protokoll: [`port/RECOMP_STATUS.md`](port/RECOMP_STATUS.md).
 
-| Gerät | GPU | Auflösung | Titelbildschirm | 3D-Wald (Open World) | RAM (PSS) |
+| Gerät | GPU | Auflösung | Titelbildschirm | 3D-Wald (Open World, `0.2.0`) | RAM (PSS) |
 |---|---|---|---|---|---|
-| AYN Odin 3 (Android 15, Snapdragon 8 Elite) | Adreno 830 | 1280×720 | **59,7–60,3 fps** (`p50 = 16,5–16,8 ms`) | **14,1–16,3 fps** (`p50 = 68,1–71,7 ms`, `gp = 0 ms` im Steady-State) | `1,11 GB` Titel / `2,07 GB` In-Game |
+| Samsung Galaxy Tab S8 Ultra (Snapdragon 8 Gen 1) | Adreno 730 | 1280×800 | **60,4 fps** (`p50 = 16,5–16,7 ms`) | **30,9–34,2 fps** (`p50 = 27,5–32,6 ms`, vorher `9,8 fps` in `0.1.0` — **3,3×–3,6× schneller**) | `2,98 GB` In-Game |
+| AYN Odin 3 (Android 15, Snapdragon 8 Elite) | Adreno 830 | 1280×720 | **59,7–60,3 fps** (`p50 = 16,5–16,8 ms`) | `0.1.0`-Baseline: `14,1–16,3 fps`; `0.2.0` zielt mit dem 3,3×–3,6× Speedup auf **~50–60 fps** | `1,11 GB` Titel / `2,07 GB` In-Game |
 
-Voraussetzungen: `arm64-v8a`-Android 10+ (API 29+), Vulkan 1.1, **ab ca. 6 GB RAM**, ca. 2,2 GB freier Speicher für Spieldaten und Shader-Caches. Verifiziert auf Qualcomm Adreno 830; Mali-/Xclipse-GPUs sind ungetestet.
+Voraussetzungen: `arm64-v8a`-Android 10+ (API 29+), Vulkan 1.1, **ab ca. 6 GB RAM**, ca. 2,2 GB freier Speicher für Spieldaten und Shader-Caches. Verifiziert auf Qualcomm Adreno 730 und Adreno 830; Mali-/Xclipse-GPUs sind ungetestet.
 
 ## Voraussetzungen für den Build
 
@@ -47,23 +48,23 @@ cd theforest-android
 ./build.sh "/pfad/zu/The Forest"
 ```
 
-Ergebnis: `out/TheForest-Android-0.1.0.apk` (ca. 76 MiB / 79,8 MB).
+Ergebnis: `out/TheForest-Android-0.2.0.apk` (ca. 64 MB).
 
 Was `./build.sh` ausführt (in Docker über `docker/Dockerfile` und `tools/build.sh`):
 
 1. Prüft die SHA-256-Prüfsummen aller fünf Win64-PE-Module deiner PC-Version.
 2. Lädt die gepinnten Drittanbieter-Quellen (`tools/fetch_deps.sh`): `pcrecomp` (+ `tools/patches/pcrecomp-theforest.patch`), `dxvk-native` `native-1.9.2b`, `Unity-Technologies/mono` `unity-5.6-mbe` (+ `tools/patches/mono-unity56-android.patch`) und `SDL 3.2.12`.
-3. Rebased die fünf PE-Module auf feste virtuelle Adressen (`tools/rebase.py`), katalogisiert `.pdata` und liftet alle 246.400 x86-64-Funktionen in 619 C-Dateien unter `gen/` (bleibt lokal).
+3. Rebased die fünf PE-Module auf feste virtuelle Adressen (`tools/rebase.py`), katalogisiert `.pdata`, liftet alle 246.400 x86-64-Funktionen in 619 C-Dateien unter `gen/` (bleibt lokal) und wendet native ARM64-NEON-/Intrinsic-Hotpath-Patches an (`tools/patch_gen.py`).
 4. Bereitet DXVK Native D3D11 für Android vor (`gfx/dxvk/prepare.py`) und kompiliert die internen Vulkan-1.1-Shader (`gfx/dxvk/shaders.py`).
 5. Kreuzkompiliert Unity Mono 4.8 (Boehm GC) für `arm64-v8a` (`tools/build_mono_android.sh`) und baut die 13 Open-Source-Mono-4.8-BCL-DLLs (`tools/build_mono_bcl.sh`) in `assets/mono_bcl/`.
-6. Kompiliert `libmain.so` (603 Units mit `-O2 -march=armv8.2-a`, 16 Units mit `-O0` laut `config/o0_host.txt`) + `libSDL3.so` für `arm64-v8a` mit Android NDK `27.3.13750724`.
-7. Baut und signiert `out/TheForest-Android-0.1.0.apk` per Gradle (erzeugt automatisch einen wiederverwendbaren Keystore in `work/release.keystore` oder nutzt `TF_KEYSTORE*`).
+6. Kompiliert `libmain.so` (**614,5/619 Units = 99,3 %** mit `-O2 -march=armv8.2-a`, nur noch 4,5 Units mit `-O0` laut `config/o0_host.txt` + `0018`-Tail-Pragma) + `libSDL3.so` für `arm64-v8a` mit Android NDK `27.3.13750724`.
+7. Baut und signiert `out/TheForest-Android-0.2.0.apk` per Gradle (erzeugt automatisch einen wiederverwendbaren Keystore in `work/release.keystore` oder nutzt `TF_KEYSTORE*`).
 
 Wenig RAM? Mit `JOBS=4 ./build.sh ...` begrenzt du die parallelen Compiler-Jobs. Auf Linux ohne Docker genügen die Pakete aus `docker/Dockerfile` und direkt `sh tools/build.sh "/pfad/zu/The Forest"`.
 
 ## Installieren & Spielen
 
-1. APK installieren: `adb install -r out/TheForest-Android-0.1.0.apk`
+1. APK installieren: `adb install -r out/TheForest-Android-0.2.0.apk`
 2. Eigene PC-Spieldaten importieren (ca. 1,99 GB: `TheForest.exe` und `TheForest_Data/`):
    - App starten und über **„Ordner wählen“** den Spielordner auswählen, **oder**
    - den Spielordner als ZIP/ZIP64 packen und über **„Datenpaket (ZIP) wählen“** entpacken (oder in `Android/obb/ch.plum.theforest/` ablegen, dann wird er beim nächsten Öffnen automatisch entpackt), **oder**
@@ -75,13 +76,13 @@ Wenig RAM? Mit `JOBS=4 ./build.sh ...` begrenzt du die parallelen Compiler-Jobs.
 - **Physischer Controller** (Handheld-Steuerung, Bluetooth, USB): direkt als XInput-Controller 0 gebunden.
 - **On-Screen-Pad (`PadView`)**: linker Stick, `A`/`B`/`X`/`Y`, `LB`/`RB`/`LT`/`RT`, `LS`/`RS`, `Back`/`Start`, Wischen rechts dreht die Kamera, kurzes Tippen klickt im Menü, **`Pad ✕`** oben rechts blendet das Pad aus/ein.
 - **Auflösung**: standardmäßig 1280 px Breite (`1280×720`, hardware-skaliert durch Android) für maximale Performance; im Launcher optional **„Volle Bildschirmauflösung“** aktivierbar.
+- **Grafik-Preset**: beim Erststart (oder einmalig beim Update von `0.1.0`) wird automatisch ein scharfes Mobil-Grafik-Preset (`FullRes`-Texturen + `FXAA` + mobil optimierte Schatten/Physik) für 30–60 fps angewendet; alle Optionen bleiben im Spiel unter `OPTIONS → GRAPHICS` frei anpassbar, und der Launcher bietet zusätzlich einen 1-Tap-Button.
 - **Spielstände, Einstellungen & Caches**: liegen unter `Android/data/ch.plum.theforest/files/user/` (`registry.dat`, `C/Users/Player/...`, `vk_pipeline.cache`, `app_process64.dxvk-cache`, `runtime.log`).
 
 ## Bekannte Einschränkungen
 
-- **Open-World-Framerate:** `ForestMain_v08` läuft auf dem Odin 3 mit Standardeinstellungen (`1280×720`) aktuell mit `14–16 fps`; niedrigere Grafik-Einstellungen im Spiel (Schatten, Gras, Sichtweite) verbessern die Performance.
 - **Multiplayer / Steamworks:** offline gestubbt (`runtime/src/steam.c`); alle Singleplayer-Modi laufen vollständig offline.
-- **GPU-Abdeckung:** bisher nur auf **Qualcomm Adreno 830** getestet; Mali-/Xclipse-GPUs sind ungetestet.
+- **GPU-Abdeckung:** verifiziert auf **Qualcomm Adreno 730 und Adreno 830**; Mali-/Xclipse-GPUs sind ungetestet.
 
 ## Lizenz
 

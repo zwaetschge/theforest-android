@@ -25,6 +25,7 @@ public class ForestActivity extends SDLActivity {
     @Override protected String[] getArguments() {
         File user = Launcher.userDir(this);
         Launcher.ensureMonoBcl(this, user);
+        QualityPreset.ensureDefault(this, user);
         return new String[] { Launcher.gameDir(this).getAbsolutePath(), user.getAbsolutePath() };
     }
 

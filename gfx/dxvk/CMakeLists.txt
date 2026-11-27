@@ -32,5 +32,9 @@ endif()
 target_include_directories(hp_dxvk PUBLIC "${DXVK_SOURCE}" "${DXVK_SOURCE}/include" "${S}/util"
   "${DXVK_SOURCE}/include/native" "${DXVK_SOURCE}/include/native/windows"
   "${DXVK_SOURCE}/include/native/directx" "${DXVK_SOURCE}/generated")
-target_compile_options(hp_dxvk PRIVATE -O2 -w -fvisibility=hidden)
+if(ANDROID)
+  target_compile_options(hp_dxvk PRIVATE -O3 -march=armv8.2-a -w -fvisibility=hidden)
+else()
+  target_compile_options(hp_dxvk PRIVATE -O2 -w -fvisibility=hidden)
+endif()
 set_property(TARGET hp_dxvk PROPERTY POSITION_INDEPENDENT_CODE ON)

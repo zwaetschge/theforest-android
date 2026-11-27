@@ -192,8 +192,11 @@ typedef struct {
 typedef struct {
     MonoMethod *method;
     uint64_t guest_va;
+    w64_fn host_fn;
     ttype_t ret;
     uint8_t nargs;
+    uint8_t is_simple;  /* no struct ret/args and <= 4 args */
+    uint64_t hits;
     ttype_t args[MAX_TRAMP_ARGS];
     char name[96];
 } tramp_entry_t;
@@ -270,6 +273,7 @@ static void *alloc_trampoline(MonoMethod *method, uint64_t guest_va)
     memset(e, 0, sizeof *e);
     e->method = method;
     e->guest_va = guest_va;
+    e->host_fn = w64_lookup_fn(guest_va);
     MonoMethodSignature *sig = mono_method_signature(method);
     e->ret = classify_mtype(mono_signature_get_return_type(sig), 1);
     int n = 0;
@@ -282,6 +286,9 @@ static void *alloc_trampoline(MonoMethod *method, uint64_t guest_va)
         e->args[n++] = classify_mtype(pt, 0);
     }
     e->nargs = (uint8_t)n;
+    int simple = (e->ret.kind != TK_STRUCT && n <= 4);
+    for (int k = 0; k < n && simple; k++) if (e->args[k].kind == TK_STRUCT) simple = 0;
+    e->is_simple = (uint8_t)simple;
     const char *cn = mono_class_get_name(mono_method_get_class(method));
     const char *mn = mono_method_get_name(method);
     snprintf(e->name, sizeof e->name, "%s::%s", cn ? cn : "?", mn ? mn : "?");
@@ -344,14 +351,74 @@ void w64_mono_log_crash(uint64_t pc, uint64_t lr, uint64_t sp, uint64_t fault)
 }
 
 /* Host ABI (x86_64 SysV or aarch64 AAPCS64) -> Win64 guest ABI dispatcher */
+static void w64_mono_tramp_slow(tramp_entry_t *e, mono_tramp_frame_t *f, CPU *c);
+
+void w64_mono_tramp_prof_dump(void)
+{
+    int top[10] = { -1,-1,-1,-1,-1,-1,-1,-1,-1,-1 };
+    uint64_t topn[10] = { 0 }, tot = 0, slow_tot = 0;
+    int n = g_ntramps;
+    for (int i = 0; i < n; i++) {
+        uint64_t h = g_tramps[i].hits;
+        if (!h) continue;
+        g_tramps[i].hits = 0;
+        tot += h;
+        if (!g_tramps[i].is_simple) slow_tot += h;
+        for (int k = 0; k < 10; k++) {
+            if (h > topn[k]) {
+                memmove(&top[k + 1], &top[k], (9 - k) * sizeof(int));
+                memmove(&topn[k + 1], &topn[k], (9 - k) * sizeof(uint64_t));
+                top[k] = i; topn[k] = h; break;
+            }
+        }
+    }
+    if (!tot) return;
+    w64_log("[prof-tramp] %llu calls (%.0f%% slow-path)", (unsigned long long)tot, 100.0 * (double)slow_tot / (double)tot);
+    for (int k = 0; k < 10 && top[k] >= 0; k++) {
+        tramp_entry_t *e = &g_tramps[top[k]];
+        w64_log("[prof-tramp] %5.1f%% %8llu %s [%s %d args]",
+                100.0 * (double)topn[k] / (double)tot, (unsigned long long)topn[k],
+                e->name, e->is_simple ? "fast" : "SLOW", e->nargs);
+    }
+}
+
 void w64_mono_tramp_dispatch(int slot, mono_tramp_frame_t *f)
 {
     tramp_entry_t *e = &g_tramps[slot];
     g_last_tramp_name = e->name;
     g_last_tramp_va = e->guest_va;
-    if (g_trace_after_lang) w64_log("[tramp] %s (0x%llx)", e->name, (unsigned long long)e->guest_va);
+    if (__builtin_expect(g_trace_after_lang, 0)) w64_log("[tramp] %s (0x%llx)", e->name, (unsigned long long)e->guest_va);
     CPU *c = ensure_cpu();
+    __atomic_fetch_add(&g_w64_tramp_calls, 1, __ATOMIC_RELAXED);
+    if (__builtin_expect(g_w64_prof_enabled, 0)) e->hits++;
 
+    /* Fast path (~95% of Unity icalls): <= 4 scalar/pointer args, scalar/void return, zero stack staging. */
+    if (__builtin_expect(e->is_simple, 1)) {
+        uint64_t w_args[4];
+        unsigned w_fmask = 0;
+        int gi = 0, fi = 0;
+        for (int i = 0; i < e->nargs; i++) {
+            uint8_t k = e->args[i].kind;
+            if (k == TK_INT) {
+                w_args[i] = f->gp[gi++];
+            } else {
+                uint64_t v = f->fp[fi++];
+                if (k == TK_F32) v &= 0xFFFFFFFFull;
+                w_fmask |= (1u << i);
+                w_args[i] = v;
+            }
+        }
+        uint64_t rax = w64_callv_fn(c, e->host_fn, e->guest_va, e->nargs, w_args, w_fmask);
+        if (e->ret.kind == TK_INT) f->ret_gp[0] = rax;
+        else if (e->ret.kind == TK_F32) f->ret_fp[0] = c->xmm[0].u64[0] & 0xFFFFFFFFull;
+        else if (e->ret.kind == TK_F64) f->ret_fp[0] = c->xmm[0].u64[0];
+        return;
+    }
+    w64_mono_tramp_slow(e, f, c);
+}
+
+static __attribute__((noinline)) void w64_mono_tramp_slow(tramp_entry_t *e, mono_tramp_frame_t *f, CPU *c)
+{
     uint64_t w_args[MAX_TRAMP_ARGS + 2];
     unsigned w_fmask = 0;
     int wn = 0;
@@ -463,7 +530,7 @@ void w64_mono_tramp_dispatch(int slot, mono_tramp_frame_t *f)
         }
     }
 
-    uint64_t rax = w64_callv(c, e->guest_va, wn, w_args, w_fmask);
+    uint64_t rax = w64_callv_fn(c, e->host_fn, e->guest_va, wn, w_args, w_fmask);
 
     /* Unpack Win64 return value into Host ABI return slots */
     if (e->ret.kind == TK_INT) {
@@ -672,6 +739,33 @@ static void w_mono_config_parse(CPU *c)
     mono_config_parse(hp);
     RETV();
 }
+/* Boehm GC root scanner hook: Unity's lifted Win64 engine holds live MonoObject* pointers in
+ * guest CPU registers (calloc'd CPU struct) and guest stacks (mmap'd 16 MiB regions), neither
+ * of which Boehm scans by default. Under -O0, shadowcpu's host-stack c_shadow accidentally hid
+ * this; under -O2, LLVM keeps registers in XMM/CPU/guest stack and Boehm collects live objects! */
+extern void (*GC_push_other_roots)(void);
+extern void GC_push_all_stack(void *bottom, void *top);
+static void (*g_prev_push_other_roots)(void);
+static int g_gc_roots_hooked;
+
+static void w64_gc_push_other_roots(void)
+{
+    if (g_prev_push_other_roots) g_prev_push_other_roots();
+    w64_gc_push_guest_roots(GC_push_all_stack);
+}
+
+static void w64_install_gc_roots_hook(void)
+{
+    if (GC_push_other_roots != w64_gc_push_other_roots) {
+        g_prev_push_other_roots = GC_push_other_roots;
+        GC_push_other_roots = w64_gc_push_other_roots;
+        if (!g_gc_roots_hooked) {
+            g_gc_roots_hooked = 1;
+            w64_log("[mono] installed Boehm GC guest stack + CPU root scanner");
+        }
+    }
+}
+
 static void w_mono_jit_init_version(CPU *c)
 {
     const char *fn = (const char *)AP(0);
@@ -681,14 +775,19 @@ static void w_mono_jit_init_version(CPU *c)
     /* Unity 5.6 passes "v2.0.50727"; our Mono 4.8 BCL is v4.0.30319 (backward-compatible with 2.0 CIL). */
     const char *use_ver = "v4.0.30319";
     w64_log("[mono] mono_jit_init_version(%s, %s -> %s)", fn ? fn : "NULL", ver ? ver : "NULL", use_ver);
+    w64_install_gc_roots_hook();
     MonoDomain *d = mono_jit_init_version(fn ? fn : "TheForest", use_ver);
+    w64_install_gc_roots_hook();
     RET((uint64_t)(uintptr_t)d);
 }
 static void w_mono_jit_init(CPU *c)
 {
     const char *fn = (const char *)AP(0);
     w64_log("[mono] mono_jit_init(%s)", fn ? fn : "NULL");
-    RET((uint64_t)(uintptr_t)mono_jit_init_version(fn ? fn : "TheForest", "v4.0.30319"));
+    w64_install_gc_roots_hook();
+    MonoDomain *d = mono_jit_init_version(fn ? fn : "TheForest", "v4.0.30319");
+    w64_install_gc_roots_hook();
+    RET((uint64_t)(uintptr_t)d);
 }
 static void w_mono_assembly_open(CPU *c)
 {

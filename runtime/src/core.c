@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -241,10 +242,18 @@ const char *w64_hostfn_name(uint64_t va)
 }
 
 static __thread uint64_t t_cur_slot;
-/* thread registry for the watchdog (W64_WATCH=<seconds>) */
-typedef struct { CPU *c; uint8_t *teb; volatile int64_t slot; uint64_t tid; volatile int suspend, parked; } treg_t;
+/* thread registry for the watchdog (W64_WATCH=<seconds>) and Boehm GC guest root scanning */
+typedef struct {
+    _Atomic(CPU *) c;
+    uint8_t *teb;
+    uint64_t stk_lo, stk_hi;
+    volatile int64_t slot;
+    uint64_t tid;
+    volatile int suspend, parked;
+} treg_t;
 static treg_t g_threads[256];
-static int g_nthreads, g_live_threads;
+static atomic_int g_nthreads, g_gc_scanning;
+static int g_live_threads;
 static __thread treg_t *t_reg;
 const char *w64_current_hostfn(void) { return g_slots[t_cur_slot].name ? g_slots[t_cur_slot].name : "?"; }
 /* Not implemented: by default log it (once per import) and return 0 like a failed call, so a
@@ -262,7 +271,7 @@ static void unimpl_import(CPU *c)
 }
 
 /* ------------------------------------------------------------------ dispatch */
-#define HT_BITS 20                     /* ~210k lifted functions over all modules */
+#define HT_BITS 19                     /* 524k slots (~47% load for 246k funcs -> 8 MB, fits L2!) */
 #define HT_SIZE (1u << HT_BITS)
 static struct { uint64_t va; void (*fn)(CPU *); } *g_ht;
 
@@ -309,6 +318,11 @@ static void (*ht_lookup(uint64_t va))(CPU *)
     }
     return NULL;
 }
+
+w64_fn w64_lookup_fn(uint64_t va) { return g_ht ? ht_lookup(va) : NULL; }
+
+uint32_t g_w64_com_calls;
+uint32_t g_w64_tramp_calls;
 
 /* W64_GLSTAT=1: calls per import/host function, reported per frame from SDL_GL_SwapWindow */
 static uint32_t *g_slot_calls;
@@ -410,6 +424,20 @@ void dispatch(CPU *c, uint64_t target)
         } else s->fn(c);
         return;
     }
+    /* Fast path for native COM methods (DXVK D3D11/DXGI, ~17k calls/frame):
+     * host code never overlaps guest PE VAs, so check before probing the 8 MB guest hash table. */
+    if (w64_native_code(target)) {
+        static uint32_t ncslot = (uint32_t)-1;
+        if (ncslot == (uint32_t)-1) ncslot = w64_import_slot("native", "COM method");
+        t_cur_slot = ncslot;
+        if (t_reg) {
+            int64_t sv = t_reg->slot;
+            if (t_reg->suspend) w64_park();
+            t_reg->slot = (int64_t)ncslot; w64_native_call(c, target); t_reg->slot = sv;
+            if (t_reg->suspend) w64_park();
+        } else w64_native_call(c, target);
+        return;
+    }
     void (*fn)(CPU *) = ht_lookup(target);
     if (fn) { fn(c); return; }
     /* An import/dynapi thunk (`jmp [rip+disp]`) that is only ever used through
@@ -425,20 +453,6 @@ void dispatch(CPU *c, uint64_t target)
             dispatch(c, rd64(slot));
             return;
         }
-    }
-    /* A method of a native object (DXVK's D3D11/DXGI COM objects live in the guest's address
-     * space and the guest calls through their vtables): native_call.c forwards it. */
-    if (w64_native_code(target)) {
-        static uint32_t ncslot = (uint32_t)-1;
-        if (ncslot == (uint32_t)-1) ncslot = w64_import_slot("native", "COM method");
-        t_cur_slot = ncslot;
-        if (t_reg) {
-            int64_t sv = t_reg->slot;
-            if (t_reg->suspend) w64_park();
-            t_reg->slot = (int64_t)ncslot; w64_native_call(c, target); t_reg->slot = sv;
-            if (t_reg->suspend) w64_park();
-        } else w64_native_call(c, target);
-        return;
     }
     if (target == 0) w64_fatal(c, "call to NULL");
     w64_fatal(c, "dispatch to unknown guest address %#llx", (unsigned long long)target);
@@ -525,9 +539,13 @@ void w64_thread_attach(CPU *c)
     t_cpu = c;
     pthread_mutex_lock(&g_slot_mu);
     t_reg = NULL;
-    for (int i = 0; i < g_nthreads && !t_reg; i++) if (!g_threads[i].c) t_reg = &g_threads[i];   /* entry of an exited thread */
-    if (!t_reg && g_nthreads < 256) t_reg = &g_threads[g_nthreads++];
-    if (t_reg) { t_reg->c = c; t_reg->teb = teb; t_reg->slot = -1; t_reg->tid = tid; }
+    int nt = atomic_load_explicit(&g_nthreads, memory_order_relaxed);
+    for (int i = 0; i < nt && !t_reg; i++) if (!atomic_load_explicit(&g_threads[i].c, memory_order_relaxed)) t_reg = &g_threads[i];   /* entry of an exited thread */
+    if (!t_reg && nt < 256) { t_reg = &g_threads[nt]; atomic_store_explicit(&g_nthreads, nt + 1, memory_order_release); }
+    if (t_reg) {
+        t_reg->teb = teb; t_reg->stk_lo = lo; t_reg->stk_hi = hi; t_reg->slot = -1; t_reg->tid = tid;
+        atomic_store_explicit(&t_reg->c, c, memory_order_release);
+    }
     g_live_threads++;
     pthread_mutex_unlock(&g_slot_mu);
 #ifdef __ANDROID__
@@ -560,10 +578,15 @@ void w64_thread_detach(void)
     uint8_t *teb = w64_teb;
     if (!c || !teb) return;
     pthread_mutex_lock(&g_slot_mu);
-    if (t_reg) { t_reg->c = NULL; t_reg->teb = NULL; t_reg->slot = -1; t_reg->tid = 0; }
+    if (t_reg) {
+        atomic_store_explicit(&t_reg->c, NULL, memory_order_release);
+        t_reg->teb = NULL; t_reg->stk_lo = 0; t_reg->stk_hi = 0; t_reg->slot = -1; t_reg->tid = 0;
+    }
     g_live_threads--;
     pthread_mutex_unlock(&g_slot_mu);
     t_reg = NULL;
+    /* Wait for any in-progress stop-the-world Boehm GC guest-root scan before freeing stack/CPU. */
+    while (atomic_load_explicit(&g_gc_scanning, memory_order_acquire) > 0) sched_yield();
     uint64_t hi, lo, tlsp, ex;
     memcpy(&hi, teb + TEB_STACK_BASE, 8);
     memcpy(&lo, teb + TEB_STACK_LIMIT, 8);
@@ -578,12 +601,35 @@ void w64_thread_detach(void)
     free(c);
 }
 
+/* Lock-free stop-the-world Boehm GC guest root pusher: pushes every live guest thread's
+ * CPU registers (rax..r15) and active guest stack [rsp-256..stk_hi]. */
+void w64_gc_push_guest_roots(void (*push_fn)(void *lo, void *hi))
+{
+    if (!push_fn) return;
+    atomic_fetch_add_explicit(&g_gc_scanning, 1, memory_order_acq_rel);
+    int nt = atomic_load_explicit(&g_nthreads, memory_order_acquire);
+    for (int i = 0; i < nt; i++) {
+        CPU *c = atomic_load_explicit(&g_threads[i].c, memory_order_acquire);
+        if (!c) continue;
+        push_fn((void *)&c->rax, (void *)(&c->r15 + 1));
+        uint64_t lo = g_threads[i].stk_lo;
+        uint64_t hi = g_threads[i].stk_hi;
+        uint64_t sp = c->rsp;
+        if (lo && hi && sp >= lo && sp <= hi) {
+            uint64_t bot = (sp >= lo + 256) ? (sp - 256) : lo;
+            bot &= ~(uint64_t)7;
+            if (bot < hi) push_fn((void *)(uintptr_t)bot, (void *)(uintptr_t)hi);
+        }
+    }
+    atomic_fetch_sub_explicit(&g_gc_scanning, 1, memory_order_release);
+}
+
 uint64_t w64_thread_id(void) { return w64_teb ? rd64((uint64_t)(uintptr_t)w64_teb + TEB_TID) : 0; }
 
 /* ------------------------------------------------------------------ host -> guest */
 #define W64_RET_MAGIC 0x00000000E5E2FFF0ull
 
-uint64_t w64_callv(CPU *c, uint64_t fn, int n, const uint64_t *args, unsigned float_mask)
+uint64_t w64_callv_fn(CPU *c, w64_fn host_fn, uint64_t fn, int n, const uint64_t *args, unsigned float_mask)
 {
     uint64_t save_rsp = c->rsp, save_rip = c->rip;
     uint64_t sp = (c->rsp - 0x40) & ~15ull;
@@ -598,12 +644,20 @@ uint64_t w64_callv(CPU *c, uint64_t fn, int n, const uint64_t *args, unsigned fl
     }
     c->rsp = sp;
     push64(c, W64_RET_MAGIC);
-    dispatch(c, fn);
+    int64_t sv_slot = -1;
+    if (t_reg) { sv_slot = t_reg->slot; t_reg->slot = -1; }
+    if (host_fn) host_fn(c); else dispatch(c, fn);
+    if (t_reg) t_reg->slot = sv_slot;
     if (c->rsp != sp)
         w64_log("[call] %#llx returned with rsp off by %lld", (unsigned long long)fn, (long long)(c->rsp - sp));
     c->rsp = save_rsp;
     c->rip = save_rip;
     return c->rax;
+}
+
+uint64_t w64_callv(CPU *c, uint64_t fn, int n, const uint64_t *args, unsigned float_mask)
+{
+    return w64_callv_fn(c, NULL, fn, n, args, float_mask);
 }
 
 uint64_t w64_call(CPU *c, uint64_t fn, int n, ...)
@@ -663,7 +717,13 @@ int w64_load(const char *gamedir)
         v = 0; memcpy(g_peb + 0x11C, &v, 4);
         uint16_t b = 19045; memcpy(g_peb + 0x120, &b, 2);
         v = 2; memcpy(g_peb + 0x124, &v, 4);            /* OSPlatformId */
-        v = 8; memcpy(g_peb + 0xB8, &v, 4);             /* NumberOfProcessors */
+#ifdef __ANDROID__
+        v = 4;
+#else
+        v = 8;
+#endif
+        { const char *e = getenv("W64_NCPU"); if (e && atoi(e) > 0) v = (uint32_t)atoi(e); }
+        memcpy(g_peb + 0xB8, &v, 4);             /* NumberOfProcessors */
     }
     ht_build();
     return 0;
@@ -717,22 +777,38 @@ static uint64_t func_of(uint64_t rip)
     return 0;
 }
 #define PROF_N 8192
-static struct { uint64_t va; uint64_t n; } g_prof[PROF_N];
-static void prof_add(uint64_t f)
+typedef struct { uint64_t va; uint64_t n; } prof_ent_t;
+static prof_ent_t g_prof[PROF_N], g_prof_main[PROF_N];
+static void prof_add_tab(prof_ent_t *tab, uint64_t f)
 {
     uint32_t h = (uint32_t)((f * 0x9E3779B97F4A7C15ull) >> 51) & (PROF_N - 1);
     for (int k = 0; k < PROF_N; k++, h = (h + 1) & (PROF_N - 1)) {
-        if (g_prof[h].va == f) { g_prof[h].n++; return; }
-        if (!g_prof[h].va) { g_prof[h].va = f; g_prof[h].n = 1; return; }
+        if (tab[h].va == f) { tab[h].n++; return; }
+        if (!tab[h].va) { tab[h].va = f; tab[h].n = 1; return; }
     }
+}
+static void prof_add(uint64_t f) { prof_add_tab(g_prof, f); }
+static int is_idle_import(const char *nm)
+{
+    if (!nm) return 0;
+    return !strcmp(nm, "WaitForSingleObject") || !strcmp(nm, "WaitForSingleObjectEx")
+        || !strcmp(nm, "WaitForMultipleObjects") || !strcmp(nm, "WaitForMultipleObjectsEx")
+        || !strcmp(nm, "Sleep") || !strcmp(nm, "SleepEx")
+        || !strcmp(nm, "SleepConditionVariableCS") || !strcmp(nm, "SleepConditionVariableSRW")
+        || !strcmp(nm, "SwitchToThread") || !strcmp(nm, "MsgWaitForMultipleObjectsEx")
+        || !strcmp(nm, "GetMessageW") || !strcmp(nm, "GetMessageA");
+}
+static int is_o0_va(uint64_t va)
+{
+    return (va >= 0x140237E10ull && va <= 0x1402A6830ull);
 }
 static void *profiler(void *arg)
 {
-    /* every 20 s: top guest functions and host imports (by name) of that window, per mille of
-     * the samples of all threads; idle waits inside imports count too, so read them as "where
-     * the threads are", not only "what burns CPU" */
+    /* every 10 s: top ACTIVE guest functions and host imports (excluding idle wait imports)
+     * plus active-sample breakdown per thread AND main-thread-only top 20 ([prof-main]). */
     (void)arg;
-    uint64_t last = w64_now_ns(), total = 0;
+    uint64_t last = w64_now_ns(), total = 0, active = 0, o0_hits = 0, main_act = 0, main_o0 = 0;
+    uint64_t thr_act[256] = { 0 }, thr_tot[256] = { 0 };
     for (;;) {
         usleep(1000);
         pthread_mutex_lock(&g_slot_mu);
@@ -740,41 +816,85 @@ static void *profiler(void *arg)
             treg_t *t = &g_threads[i];
             if (!t->c) continue;
             int64_t sl = t->slot;
-            if (sl >= 0) { prof_add(HLE_SENTINEL(sl)); total++; continue; }   /* inside an import */
+            total++; thr_tot[i]++;
+            if (sl >= 0) {
+                const char *nm = g_slots[sl].name;
+                if (!is_idle_import(nm)) {
+                    uint64_t sv = HLE_SENTINEL(sl);
+                    prof_add(sv); active++; thr_act[i]++;
+                    if (i == 0) { prof_add_tab(g_prof_main, sv); main_act++; }
+                }
+                continue;
+            }
             uint64_t rip = t->c->rip;
             if (!rip) continue;
-            prof_add(func_of(rip)); total++;
+            uint64_t f = func_of(rip);
+            prof_add(f); active++; thr_act[i]++;
+            int o0 = is_o0_va(f);
+            if (o0) o0_hits++;
+            if (i == 0) { prof_add_tab(g_prof_main, f); main_act++; if (o0) main_o0++; }
         }
         pthread_mutex_unlock(&g_slot_mu);
-        if (w64_now_ns() - last > 20000000000ull) {
+        if (w64_now_ns() - last > 10000000000ull) {
             last = w64_now_ns();
-            uint64_t top[20] = { 0 }, topn[20] = { 0 };
+            uint64_t top[25] = { 0 }, topn[25] = { 0 };
             for (int h = 0; h < PROF_N; h++) {
                 if (!g_prof[h].va) continue;
-                for (int k = 0; k < 20; k++)
+                for (int k = 0; k < 25; k++)
                     if (g_prof[h].n > topn[k]) {
-                        memmove(&top[k + 1], &top[k], (19 - k) * 8); memmove(&topn[k + 1], &topn[k], (19 - k) * 8);
+                        memmove(&top[k + 1], &top[k], (24 - k) * 8); memmove(&topn[k + 1], &topn[k], (24 - k) * 8);
                         top[k] = g_prof[h].va; topn[k] = g_prof[h].n; break;
                     }
             }
-            w64_log("[prof] %llu samples (%d threads live, %d registry entries)", (unsigned long long)total, g_live_threads, g_nthreads);
-            for (int k = 0; k < 20 && top[k]; k++) {
+            w64_log("[prof] %llu active / %llu total samples (%d live threads, O0=%.1f%%, main_O0=%.1f%%)",
+                    (unsigned long long)active, (unsigned long long)total, g_live_threads,
+                    100.0 * (double)o0_hits / (double)(active ? active : 1),
+                    100.0 * (double)main_o0 / (double)(main_act ? main_act : 1));
+            for (int i = 0; i < g_nthreads; i++) {
+                if (thr_act[i] >= 500)
+                    w64_log("[prof-thr] idx=%d tid=%#llx active=%llu/%llu (%.0f%%)",
+                            i, (unsigned long long)g_threads[i].tid, (unsigned long long)thr_act[i],
+                            (unsigned long long)thr_tot[i], 100.0 * (double)thr_act[i] / (double)(thr_tot[i] ? thr_tot[i] : 1));
+            }
+            for (int k = 0; k < 15 && top[k]; k++) {
                 uint64_t va = top[k];
                 const char *nm = NULL;
                 if (va >= HLE_SENTINEL(0) && va < HLE_SENTINEL(W64_SENT_SLOTS)) nm = g_slots[(va - HLE_SENTINEL(0)) / 8].name;
-                w64_log("[prof] %5.1f%% %#llx %s", 100.0 * (double)topn[k] / (double)(total ? total : 1),
-                        (unsigned long long)va, nm ? nm : "");
+                w64_log("[prof] %5.1f%% %#llx %s%s", 100.0 * (double)topn[k] / (double)(active ? active : 1),
+                        (unsigned long long)va, nm ? nm : "", (!nm && is_o0_va(va)) ? "[O0]" : "");
             }
+            uint64_t mtop[20] = { 0 }, mtopn[20] = { 0 };
+            for (int h = 0; h < PROF_N; h++) {
+                if (!g_prof_main[h].va) continue;
+                for (int k = 0; k < 20; k++)
+                    if (g_prof_main[h].n > mtopn[k]) {
+                        memmove(&mtop[k + 1], &mtop[k], (19 - k) * 8); memmove(&mtopn[k + 1], &mtopn[k], (19 - k) * 8);
+                        mtop[k] = g_prof_main[h].va; mtopn[k] = g_prof_main[h].n; break;
+                    }
+            }
+            for (int k = 0; k < 20 && mtop[k]; k++) {
+                uint64_t va = mtop[k];
+                const char *nm = NULL;
+                if (va >= HLE_SENTINEL(0) && va < HLE_SENTINEL(W64_SENT_SLOTS)) nm = g_slots[(va - HLE_SENTINEL(0)) / 8].name;
+                w64_log("[prof-main] %5.1f%% %#llx %s%s", 100.0 * (double)mtopn[k] / (double)(main_act ? main_act : 1),
+                        (unsigned long long)va, nm ? nm : "", (!nm && is_o0_va(va)) ? "[O0]" : "");
+            }
+            { extern void w64_mono_tramp_prof_dump(void); w64_mono_tramp_prof_dump(); }
             memset(g_prof, 0, sizeof g_prof);
-            total = 0;
+            memset(g_prof_main, 0, sizeof g_prof_main);
+            memset(thr_act, 0, sizeof thr_act);
+            memset(thr_tot, 0, sizeof thr_tot);
+            total = active = o0_hits = main_act = main_o0 = 0;
         }
     }
     return NULL;
 }
 
+int g_w64_prof_enabled;
+
 int w64_run_entry(void)
 {
-    if (getenv("W64_PROF")) { pthread_t th; pthread_create(&th, NULL, profiler, NULL); }
+    if (getenv("W64_PROF")) { g_w64_prof_enabled = 1; pthread_t th; pthread_create(&th, NULL, profiler, NULL); }
     if (getenv("W64_WATCH")) { pthread_t th; pthread_create(&th, NULL, watchdog, (void *)(intptr_t)atoi(getenv("W64_WATCH"))); }
     CPU *c = calloc(1, sizeof(CPU));
     w64_thread_attach(c);

@@ -40,7 +40,8 @@ def transform(m):
     if 'ES3_EH_ENTER' in body or 'c_shadow' in body:
         return m.group(0)
     # giant straight-line init functions: no gain, and clang -O1 crawls on them
-    if body.count('\n') > 6000:
+    # Exception: hot Unity render-thread command loop GfxDeviceWorker::RunCommand (L_0001403426E0)
+    if body.count('\n') > 6000 and name != 'L_0001403426E0':
         return m.group(0)
     used = set(ALWAYS)
     xmms = set()

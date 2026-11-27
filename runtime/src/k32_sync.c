@@ -39,6 +39,7 @@ uint64_t w64_thread_id(void);
  * the pages go back to the system at once. */
 #include <sys/syscall.h>
 #include <linux/falloc.h>
+#include <linux/futex.h>
 #include <fcntl.h>
 #define BIG_MIN   (64u << 10)
 #define GRAN      (64u << 10)
@@ -717,15 +718,119 @@ static void InitOnceComplete_(CPU *c)
 typedef struct {
     int kind;                    /* H_EVENT, H_MUTEX, H_SEM, H_THREAD */
     int manual, signaled;        /* event */
-    int32_t count, max;          /* semaphore */
+    _Atomic int32_t count;       /* semaphore (lock-free atomic + futex!) */
+    int32_t max;                 /* semaphore max */
     uint64_t owner; int rec;     /* mutex */
     int exited; uint32_t code;   /* thread */
     pthread_t th;
     uint64_t tid;                /* thread: guest thread id */
     int start_hold;              /* thread: CREATE_SUSPENDED count not yet resumed */
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    _Atomic uint32_t waiters;       /* WaitForSingleObject / CREATE_SUSPENDED waiters on THIS object */
+    _Atomic uint32_t multi_waiters; /* WaitForMultipleObjects waiters watching THIS object */
 } wobj_t;
-static pthread_mutex_t g_wmu = PTHREAD_MUTEX_INITIALIZER;
+/* Strict lock hierarchy: g_multi_mu (only held by WaitForMultipleObjects or multi-wake)
+ * -> o->mu (in ascending pointer order if locking >1). Wakers ALWAYS release o->mu BEFORE
+ * signaling o->cv or acquiring g_multi_mu (wobj_t is never freed), eliminating lock inversion
+ * AND Bionic hurry-up-and-wait futex ping-pong! */
+static pthread_mutex_t g_multi_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_wcv = PTHREAD_COND_INITIALIZER;
+
+static wobj_t *wobj_alloc(int kind)
+{
+    wobj_t *o = calloc(1, sizeof *o);
+    o->kind = kind;
+    pthread_mutex_init(&o->mu, NULL);
+    pthread_cond_init(&o->cv, NULL);
+    return o;
+}
+/* Release o->mu and wake waiters on `o` (caller holds o->mu). Safe to signal o->cv after unlock
+ * because wobj_t objects live for the lifetime of the process. */
+static inline void wobj_wake_unlock(wobj_t *o, int32_t count, int all)
+{
+    uint32_t w = atomic_load_explicit(&o->waiters, memory_order_relaxed);
+    uint32_t mw = atomic_load_explicit(&o->multi_waiters, memory_order_relaxed);
+    pthread_mutex_unlock(&o->mu);
+    if (w) {
+        if (all || (count > 1 && (uint32_t)count >= w)) pthread_cond_broadcast(&o->cv);
+        else if (count <= 1) pthread_cond_signal(&o->cv);
+        else { for (int32_t i = 0; i < count; i++) pthread_cond_signal(&o->cv); }
+    }
+    if (__builtin_expect(mw != 0, 0)) {
+        pthread_mutex_lock(&g_multi_mu);
+        pthread_cond_broadcast(&g_wcv);
+        pthread_mutex_unlock(&g_multi_mu);
+    }
+}
+
+static inline int32_t sem_post_fast(wobj_t *o, int32_t add)
+{
+    int32_t prev, next;
+    do {
+        prev = atomic_load_explicit(&o->count, memory_order_relaxed);
+        next = prev + add;
+        if (o->max && next > o->max) next = o->max;
+    } while (!atomic_compare_exchange_weak_explicit(&o->count, &prev, next,
+                                                    memory_order_acq_rel, memory_order_relaxed));
+    atomic_thread_fence(memory_order_seq_cst);
+    if (__builtin_expect(atomic_load_explicit(&o->waiters, memory_order_relaxed) != 0, 0))
+        syscall(SYS_futex, (int32_t *)&o->count, FUTEX_WAKE_PRIVATE, add, NULL, NULL, 0);
+    if (__builtin_expect(atomic_load_explicit(&o->multi_waiters, memory_order_relaxed) != 0, 0)) {
+        pthread_mutex_lock(&g_multi_mu);
+        pthread_cond_broadcast(&g_wcv);
+        pthread_mutex_unlock(&g_multi_mu);
+    }
+    return prev;
+}
+
+static inline uint32_t sem_wait_fast(wobj_t *x, uint32_t ms)
+{
+    /* Fast lock-free acquire + brief spin (only if no other waiter is already sleeping)
+     * so Unity JobQueue micro-job bursts hand off in ~100ns without futex syscalls! */
+    int max_spin = (atomic_load_explicit(&x->waiters, memory_order_relaxed) == 0) ? 512 : 64;
+    for (int spin = 0; ; spin++) {
+        int32_t v = atomic_load_explicit(&x->count, memory_order_acquire);
+        while (v > 0) {
+            if (atomic_compare_exchange_weak_explicit(&x->count, &v, v - 1,
+                                                      memory_order_acq_rel, memory_order_acquire))
+                return WAIT_OBJECT_0;
+        }
+        if (ms == 0) return WAIT_TIMEOUT;
+        if (spin < max_spin) {
+#if defined(__aarch64__)
+            __asm__ __volatile__("yield" ::: "memory");
+#endif
+            continue;
+        }
+        break;
+    }
+    uint64_t deadline = (ms == INFINITE_) ? 0 : (w64_now_ns() + (uint64_t)ms * 1000000ull);
+    atomic_fetch_add_explicit(&x->waiters, 1, memory_order_seq_cst);
+    for (;;) {
+        int32_t v = atomic_load_explicit(&x->count, memory_order_acquire);
+        while (v > 0) {
+            if (atomic_compare_exchange_weak_explicit(&x->count, &v, v - 1,
+                                                      memory_order_acq_rel, memory_order_acquire)) {
+                atomic_fetch_sub_explicit(&x->waiters, 1, memory_order_relaxed);
+                return WAIT_OBJECT_0;
+            }
+        }
+        struct timespec ts, *tsp = NULL;
+        if (ms != INFINITE_) {
+            uint64_t now = w64_now_ns();
+            if (now >= deadline) {
+                atomic_fetch_sub_explicit(&x->waiters, 1, memory_order_relaxed);
+                return WAIT_TIMEOUT;
+            }
+            uint64_t rem = deadline - now;
+            ts.tv_sec = (time_t)(rem / 1000000000ull);
+            ts.tv_nsec = (long)(rem % 1000000000ull);
+            tsp = &ts;
+        }
+        syscall(SYS_futex, (int32_t *)&x->count, FUTEX_WAIT_PRIVATE, 0, tsp, NULL, 0);
+    }
+}
 
 static wobj_t *wobj(uint64_t h)
 {
@@ -736,97 +841,108 @@ static wobj_t *wobj(uint64_t h)
 
 static void CreateEventW_(CPU *c)
 {
-    wobj_t *o = calloc(1, sizeof *o);
-    o->kind = H_EVENT; o->manual = AI(1) != 0; o->signaled = AI(2) != 0;
+    wobj_t *o = wobj_alloc(H_EVENT);
+    o->manual = AI(1) != 0; o->signaled = AI(2) != 0;
     RET(w64_handle_new(H_EVENT, o));
 }
 static void CreateEventExW_(CPU *c)     /* (sa, name, flags, access): 1 = manual reset, 2 = initially set */
 {
-    wobj_t *o = calloc(1, sizeof *o);
-    o->kind = H_EVENT; o->manual = (AU(2) & 1) != 0; o->signaled = (AU(2) & 2) != 0;
+    wobj_t *o = wobj_alloc(H_EVENT);
+    o->manual = (AU(2) & 1) != 0; o->signaled = (AU(2) & 2) != 0;
     RET(w64_handle_new(H_EVENT, o));
 }
 static void SetEvent_(CPU *c)
 {
     wobj_t *o = wobj(A(0));
     if (!o) RET(0);
-    pthread_mutex_lock(&g_wmu); o->signaled = 1; pthread_cond_broadcast(&g_wcv); pthread_mutex_unlock(&g_wmu);
+    pthread_mutex_lock(&o->mu);
+    o->signaled = 1;
+    wobj_wake_unlock(o, 1, o->manual);
     RET(1);
 }
 static void ResetEvent_(CPU *c)
 {
     wobj_t *o = wobj(A(0));
     if (!o) RET(0);
-    pthread_mutex_lock(&g_wmu); o->signaled = 0; pthread_mutex_unlock(&g_wmu);
+    pthread_mutex_lock(&o->mu); o->signaled = 0; pthread_mutex_unlock(&o->mu);
     RET(1);
 }
 static void CreateMutexW_(CPU *c)
 {
-    wobj_t *o = calloc(1, sizeof *o);
-    o->kind = H_MUTEX;
+    wobj_t *o = wobj_alloc(H_MUTEX);
     if (AI(1)) { o->owner = w64_thread_id(); o->rec = 1; }
     RET(w64_handle_new(H_MUTEX, o));
 }
 static void CreateSemaphoreW_(CPU *c)
 {
-    wobj_t *o = calloc(1, sizeof *o);
-    o->kind = H_SEM; o->count = AI(1); o->max = AI(2);
+    wobj_t *o = wobj_alloc(H_SEM);
+    atomic_store_explicit(&o->count, AI(1), memory_order_relaxed);
+    o->max = AI(2);
     RET(w64_handle_new(H_SEM, o));
 }
 static void CreateSemaphoreExW_(CPU *c)  /* (sa, initial, max, name, flags, access) */
 {
-    wobj_t *o = calloc(1, sizeof *o);
-    o->kind = H_SEM; o->count = AI(1); o->max = AI(2);
+    wobj_t *o = wobj_alloc(H_SEM);
+    atomic_store_explicit(&o->count, AI(1), memory_order_relaxed);
+    o->max = AI(2);
     RET(w64_handle_new(H_SEM, o));
 }
 static void ReleaseSemaphore_(CPU *c)
 {
     wobj_t *o = wobj(A(0));
-    if (!o) RET(0);
-    pthread_mutex_lock(&g_wmu);
-    if (A(2)) wr32(A(2), (uint32_t)o->count);
-    o->count += AI(1);
-    if (o->max && o->count > o->max) o->count = o->max;
-    pthread_cond_broadcast(&g_wcv);
-    pthread_mutex_unlock(&g_wmu);
+    if (!o || o->kind != H_SEM) RET(0);
+    int32_t add = AI(1);
+    if (add <= 0) RET(0);
+    int32_t prev = sem_post_fast(o, add);
+    if (A(2)) wr32(A(2), (uint32_t)prev);
     RET(1);
 }
 
 /* Host-side waitable objects (DXVK's frame latency semaphore, Flush1 events): guest handles. */
 uint64_t w64_sem_create(int32_t initial, int32_t max)
 {
-    wobj_t *o = calloc(1, sizeof *o);
-    o->kind = H_SEM; o->count = initial; o->max = max;
+    wobj_t *o = wobj_alloc(H_SEM);
+    atomic_store_explicit(&o->count, initial, memory_order_relaxed);
+    o->max = max;
     return w64_handle_new(H_SEM, o);
 }
 void w64_sem_release(uint64_t h)
 {
     wobj_t *o = wobj(h);
     if (!o) return;
-    pthread_mutex_lock(&g_wmu);
-    if (o->kind == H_SEM && (!o->max || o->count < o->max)) o->count++;
-    else if (o->kind == H_EVENT) o->signaled = 1;
-    pthread_cond_broadcast(&g_wcv);
-    pthread_mutex_unlock(&g_wmu);
+    if (o->kind == H_SEM) { sem_post_fast(o, 1); return; }
+    pthread_mutex_lock(&o->mu);
+    if (o->kind == H_EVENT) o->signaled = 1;
+    wobj_wake_unlock(o, 1, o->kind == H_EVENT && o->manual);
 }
 
 static int w_ready(wobj_t *o, uint64_t me)
 {
     switch (o->kind) {
     case H_EVENT: return o->signaled;
-    case H_SEM: return o->count > 0;
+    case H_SEM: return atomic_load_explicit(&o->count, memory_order_acquire) > 0;
     case H_MUTEX: return !o->rec || o->owner == me;
     case H_THREAD: return o->exited;
     }
     return 1;
 }
-static void w_take(wobj_t *o, uint64_t me)
+static int w_try_take(wobj_t *o, uint64_t me)
 {
     switch (o->kind) {
-    case H_EVENT: if (!o->manual) o->signaled = 0; break;
-    case H_SEM: o->count--; break;
-    case H_MUTEX: o->owner = me; o->rec++; break;
+    case H_EVENT: if (!o->signaled) return 0; if (!o->manual) o->signaled = 0; return 1;
+    case H_SEM: {
+        int32_t v = atomic_load_explicit(&o->count, memory_order_acquire);
+        while (v > 0) {
+            if (atomic_compare_exchange_weak_explicit(&o->count, &v, v - 1,
+                                                      memory_order_acq_rel, memory_order_acquire))
+                return 1;
+        }
+        return 0;
     }
+    case H_MUTEX: if (o->rec && o->owner != me) return 0; o->owner = me; o->rec++; return 1;
+    case H_THREAD: return o->exited != 0;
+    }
+    return 1;
 }
 
 uint32_t w64_wait_objs(int n, const uint64_t *hs, int all, uint32_t ms)
@@ -841,39 +957,85 @@ uint32_t w64_wait_objs(int n, const uint64_t *hs, int all, uint32_t ms)
             return WAIT_FAILED;
         }
     }
+    /* Fast lock-free atomic + futex path for single-semaphore WaitForSingleObject */
+    if (n == 1 && o[0]->kind == H_SEM) return sem_wait_fast(o[0], ms);
     uint64_t me = w64_thread_id();
-    pthread_mutex_lock(&g_wmu);
+    /* Per-object mutex + condvar for WaitForSingleObject (n == 1): zero global lock contention! */
+    if (n == 1) {
+        wobj_t *x = o[0];
+        pthread_mutex_lock(&x->mu);
+        for (;;) {
+            if (w_try_take(x, me)) { pthread_mutex_unlock(&x->mu); return WAIT_OBJECT_0; }
+            if (ms == 0) break;
+            atomic_fetch_add_explicit(&x->waiters, 1, memory_order_relaxed);
+            int r = timed_wait(&x->cv, &x->mu, ms);
+            atomic_fetch_sub_explicit(&x->waiters, 1, memory_order_relaxed);
+            if (r == ETIMEDOUT) {
+                if (w_try_take(x, me)) { pthread_mutex_unlock(&x->mu); return WAIT_OBJECT_0; }
+                break;
+            }
+        }
+        pthread_mutex_unlock(&x->mu);
+        return WAIT_TIMEOUT;
+    }
+    /* Multi-object path (WaitForMultipleObjects, n > 1): lock g_multi_mu then unique o[] sorted by addr. */
+    wobj_t *u[64];
+    int nu = 0;
+    for (int i = 0; i < n; i++) {
+        int dup = 0;
+        for (int j = 0; j < nu; j++) if (u[j] == o[i]) { dup = 1; break; }
+        if (!dup) u[nu++] = o[i];
+    }
+    for (int i = 1; i < nu; i++) {
+        wobj_t *key = u[i]; int j = i - 1;
+        while (j >= 0 && (uintptr_t)u[j] > (uintptr_t)key) { u[j + 1] = u[j]; j--; }
+        u[j + 1] = key;
+    }
+    pthread_mutex_lock(&g_multi_mu);
+    for (int i = 0; i < nu; i++) {
+        pthread_mutex_lock(&u[i]->mu);
+        atomic_fetch_add_explicit(&u[i]->multi_waiters, 1, memory_order_seq_cst);
+    }
+    uint32_t res = WAIT_TIMEOUT;
     for (;;) {
         if (all) {
             int ok = 1;
             for (int i = 0; i < n; i++) if (!w_ready(o[i], me)) { ok = 0; break; }
-            if (ok) { for (int i = 0; i < n; i++) w_take(o[i], me); pthread_mutex_unlock(&g_wmu); return WAIT_OBJECT_0; }
+            if (ok) {
+                int taken = 0;
+                for (int i = 0; i < n; i++) {
+                    if (!w_try_take(o[i], me)) {
+                        for (int j = 0; j < taken; j++)
+                            if (o[j]->kind == H_SEM) sem_post_fast(o[j], 1);
+                        ok = 0;
+                        break;
+                    }
+                    taken++;
+                }
+                if (ok) { res = WAIT_OBJECT_0; break; }
+            }
         } else {
+            int hit = -1;
             for (int i = 0; i < n; i++)
-                if (w_ready(o[i], me)) { w_take(o[i], me); pthread_mutex_unlock(&g_wmu); return WAIT_OBJECT_0 + (uint32_t)i; }
+                if (w_try_take(o[i], me)) { hit = i; break; }
+            if (hit >= 0) { res = WAIT_OBJECT_0 + (uint32_t)hit; break; }
         }
         if (ms == 0) break;
-        static int waitlog = -1;
-        if (waitlog < 0) waitlog = getenv("W64_WAITLOG") != NULL;
-        if (waitlog && ms == INFINITE_) {           /* debug: report waits that block for long */
-            static __thread int logged;
-            if (timed_wait(&g_wcv, &g_wmu, 5000) == ETIMEDOUT && !logged) {
-                logged = 1;
-                for (int i = 0; i < n; i++)
-                    w64_log("[wait] thread %#llx blocked 5 s on %d/%d: handle %#llx kind %d signaled %d count %d",
-                            (unsigned long long)me, i, n, (unsigned long long)hs[i], o[i]->kind, o[i]->signaled, o[i]->count);
-            }
-            continue;
-        }
-        if (timed_wait(&g_wcv, &g_wmu, ms) == ETIMEDOUT) {
-            /* re-check once, then time out */
+        for (int i = nu - 1; i >= 0; i--) pthread_mutex_unlock(&u[i]->mu);
+        int r = timed_wait(&g_wcv, &g_multi_mu, ms);
+        for (int i = 0; i < nu; i++) pthread_mutex_lock(&u[i]->mu);
+        if (r == ETIMEDOUT) {
             for (int i = 0; i < n && !all; i++)
-                if (w_ready(o[i], me)) { w_take(o[i], me); pthread_mutex_unlock(&g_wmu); return WAIT_OBJECT_0 + (uint32_t)i; }
+                if (w_try_take(o[i], me)) { res = WAIT_OBJECT_0 + (uint32_t)i; break; }
             break;
         }
     }
-    pthread_mutex_unlock(&g_wmu);
-    return WAIT_TIMEOUT;
+    for (int i = nu - 1; i >= 0; i--) {
+        atomic_fetch_sub_explicit(&u[i]->multi_waiters, 1, memory_order_relaxed);
+        pthread_mutex_unlock(&u[i]->mu);
+    }
+    pthread_mutex_unlock(&g_multi_mu);
+    return res;
 }
 static void WaitForSingleObject_(CPU *c) { uint64_t h = A(0); RET(w64_wait_objs(1, &h, 0, AU(1))); }
 static void WaitForSingleObjectEx_(CPU *c) { uint64_t h = A(0); RET(w64_wait_objs(1, &h, 0, AU(1))); }
@@ -924,9 +1086,13 @@ static void fls_run_callbacks(CPU *c)
 static void *thread_main(void *arg)
 {
     thr_t *t = arg;
-    pthread_mutex_lock(&g_wmu);
-    while (t->obj->start_hold > 0) pthread_cond_wait(&g_wcv, &g_wmu);   /* CREATE_SUSPENDED */
-    pthread_mutex_unlock(&g_wmu);
+    pthread_mutex_lock(&t->obj->mu);
+    while (t->obj->start_hold > 0) {
+        t->obj->waiters++;
+        pthread_cond_wait(&t->obj->cv, &t->obj->mu);   /* CREATE_SUSPENDED */
+        t->obj->waiters--;
+    }
+    pthread_mutex_unlock(&t->obj->mu);
     t_thr = t;
     w64_preset_tid = t->tid;
     CPU *c = w64_cpu();          /* guest stack, TEB, TLS, DLL_THREAD_ATTACH callbacks */
@@ -936,11 +1102,10 @@ static void *thread_main(void *arg)
     }
     fls_run_callbacks(c);
     w64_thread_detach();
-    pthread_mutex_lock(&g_wmu);
+    pthread_mutex_lock(&t->obj->mu);
     t->obj->exited = 1;
     t->obj->code = t->exit_code;
-    pthread_cond_broadcast(&g_wcv);
-    pthread_mutex_unlock(&g_wmu);
+    wobj_wake_unlock(t->obj, 1, 1);
     t_thr = NULL;
     free(t);
     return NULL;
@@ -950,8 +1115,7 @@ static void CreateThread_(CPU *c)
 {
     thr_t *t = calloc(1, sizeof *t);
     t->start = A(2); t->param = A(3); t->tid = w64_alloc_tid();
-    t->obj = calloc(1, sizeof(wobj_t));
-    t->obj->kind = H_THREAD;
+    t->obj = wobj_alloc(H_THREAD);
     t->obj->tid = t->tid;
     if (AU(4) & 4) t->obj->start_hold = 1;          /* CREATE_SUSPENDED */
     uint64_t h = w64_handle_new(H_THREAD, t->obj);
@@ -1108,7 +1272,7 @@ static uint64_t thread_tid(uint64_t h)
 static void SuspendThread_(CPU *c)
 {
     wobj_t *o = A(0) == (uint64_t)-2 ? NULL : wobj(A(0));
-    if (o && o->kind == H_THREAD && o->start_hold > 0) { pthread_mutex_lock(&g_wmu); int p = o->start_hold++; pthread_mutex_unlock(&g_wmu); RET((uint32_t)p); }
+    if (o && o->kind == H_THREAD && o->start_hold > 0) { pthread_mutex_lock(&o->mu); int p = o->start_hold++; pthread_mutex_unlock(&o->mu); RET((uint32_t)p); }
     int r = w64_thread_suspend(thread_tid(A(0)));
     RET(r < 0 ? 0xFFFFFFFFu : (uint32_t)r);
 }
@@ -1116,10 +1280,9 @@ static void ResumeThread_(CPU *c)
 {
     wobj_t *o = A(0) == (uint64_t)-2 ? NULL : wobj(A(0));
     if (o && o->kind == H_THREAD && o->start_hold > 0) {
-        pthread_mutex_lock(&g_wmu);
+        pthread_mutex_lock(&o->mu);
         int p = o->start_hold--;
-        pthread_cond_broadcast(&g_wcv);
-        pthread_mutex_unlock(&g_wmu);
+        wobj_wake_unlock(o, 1, 1);
         RET((uint32_t)p);
     }
     int r = w64_thread_resume(thread_tid(A(0)));
@@ -1145,8 +1308,8 @@ static void DuplicateHandle_(CPU *c)
 {
     uint64_t src = A(1), out = A(3);
     if (src == (uint64_t)-2) {
-        wobj_t *o = calloc(1, sizeof *o);
-        o->kind = H_THREAD; o->tid = w64_thread_id();
+        wobj_t *o = wobj_alloc(H_THREAD);
+        o->tid = w64_thread_id();
         if (out) wr64(out, w64_handle_new(H_THREAD, o));
         RET(1);
     }
@@ -1204,7 +1367,12 @@ static void TlsAlloc_(CPU *c)
     RET(0xFFFFFFFFu);
 }
 static void TlsFree_(CPU *c) { uint32_t i = AU(0); if (i < 1088) g_tls_used[i] = 0; RET(1); }
-static void TlsGetValue_(CPU *c) { uint32_t i = AU(0); w64_set_last_error(0); RET(i < 1088 ? rd64(tls_slot_addr(i)) : 0); }
+uint64_t w64_tls_get(uint32_t i)
+{
+    w64_set_last_error(0);
+    return i < 1088 ? rd64(tls_slot_addr(i)) : 0;
+}
+static void TlsGetValue_(CPU *c) { RET(w64_tls_get(AU(0))); }
 static void TlsSetValue_(CPU *c) { uint32_t i = AU(0); if (i >= 1088) RET(0); wr64(tls_slot_addr(i), A(1)); RET(1); }
 
 static void FlsAlloc_(CPU *c)
@@ -1268,12 +1436,11 @@ static void SignalObjectAndWait_(CPU *c)                  /* (signal, wait, ms, 
 {
     wobj_t *o = wobj(A(0));
     if (o) {
-        pthread_mutex_lock(&g_wmu);
+        pthread_mutex_lock(&o->mu);
         if (o->kind == H_EVENT) o->signaled = 1;
-        else if (o->kind == H_SEM && o->count < o->max) o->count++;
+        else if (o->kind == H_SEM && (!o->max || o->count < o->max)) o->count++;
         else if (o->kind == H_MUTEX && o->rec > 0 && --o->rec == 0) o->owner = 0;
-        pthread_cond_broadcast(&g_wcv);
-        pthread_mutex_unlock(&g_wmu);
+        wobj_wake_unlock(o, 1, o->kind == H_EVENT && o->manual);
     }
     uint64_t h = A(1);
     RET(w64_wait_objs(1, &h, 0, AU(2)));
@@ -1309,7 +1476,9 @@ static void *wtimer_main(void *arg)
         pthread_mutex_unlock(&t->mu);
         wobj_t *o = wobj(h);
         if (!o) return NULL;
-        pthread_mutex_lock(&g_wmu); o->signaled = 1; pthread_cond_broadcast(&g_wcv); pthread_mutex_unlock(&g_wmu);
+        pthread_mutex_lock(&o->mu);
+        o->signaled = 1;
+        wobj_wake_unlock(o, 1, o->manual);
         pthread_mutex_lock(&t->mu);
     }
     return NULL;
@@ -1317,8 +1486,8 @@ static void *wtimer_main(void *arg)
 static wtim_t *g_wtims[256];
 static void create_wtimer(CPU *c, int manual)
 {
-    wobj_t *o = calloc(1, sizeof *o);
-    o->kind = H_EVENT; o->manual = manual;
+    wobj_t *o = wobj_alloc(H_EVENT);
+    o->manual = manual;
     uint64_t h = w64_handle_new(H_EVENT, o);
     wtim_t *t = calloc(1, sizeof *t); t->h = h;
     pthread_mutex_init(&t->mu, NULL);
@@ -1336,7 +1505,7 @@ static void SetWaitableTimer_(CPU *c)
     wobj_t *o = wobj(A(0));
     if (!t || t->h != A(0) || !o) RET(0);
     int64_t due = (int64_t)rd64(A(1));
-    pthread_mutex_lock(&g_wmu); o->signaled = 0; pthread_mutex_unlock(&g_wmu);
+    pthread_mutex_lock(&o->mu); o->signaled = 0; pthread_mutex_unlock(&o->mu);
     uint64_t now = w64_now_ns(), target;
     if (due < 0) target = now + (uint64_t)(-due) * 100ull;
     else {
@@ -1412,8 +1581,8 @@ static void DeleteTimerQueueTimer_(CPU *c) { tqt_t *t = AP(1); if (t) t->stop = 
 
 static void OpenThread_(CPU *c)                           /* (access, inherit, tid) */
 {
-    wobj_t *o = calloc(1, sizeof *o);
-    o->kind = H_THREAD; o->tid = AU(2);
+    wobj_t *o = wobj_alloc(H_THREAD);
+    o->tid = AU(2);
     RET(w64_handle_new(H_THREAD, o));
 }
 static void SetThreadAffinityMask_(CPU *c) { RET(0xFF); }

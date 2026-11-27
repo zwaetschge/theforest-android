@@ -26,7 +26,7 @@ int32_t hp_d3d11_create_device(void *adapter, uint32_t driver, uint32_t flags, c
                                uint32_t sdk, void **device, void *level, void **context);
 int32_t hp_dxgi_create_factory(uint32_t flags, const void *riid, void **out);
 
-enum { NK_UNKNOWN = 0, NK_GENERIC, NK_CLEAR_DSV, NK_SET_MINLOD, NK_GET_MINLOD, NK_PRESENT, NK_PRESENT1, NK_CREATE_SC, NK_CREATE_SC_HWND, NK_RESIZE_BUFFERS, NK_DESC_FIRST = 16 };
+enum { NK_UNKNOWN = 0, NK_GENERIC, NK_CLEAR_DSV, NK_SET_MINLOD, NK_GET_MINLOD, NK_PRESENT, NK_PRESENT1, NK_CREATE_SC, NK_CREATE_SC_HWND, NK_RESIZE_BUFFERS, NK_REG4, NK_REG8, NK_DESC_FIRST = 16 };
 
 /* ---- the native image: code range (call targets) and whole range (vtables) ---- */
 static uint64_t g_code_lo, g_code_hi, g_img_lo, g_img_hi;
@@ -63,12 +63,15 @@ int w64_native_image(uint64_t va) { if (!g_code_hi) range_init(); return va >= g
 #define KBITS 14
 static struct { uint64_t key; int kind; } g_kinds[1 << KBITS];
 static pthread_mutex_t g_kmu = PTHREAD_MUTEX_INITIALIZER;
+static __thread struct { uint64_t fn; int kind; } t_kcache[64];
 static int kind_of(CPU *c, uint64_t fn)
 {
+    uint32_t ci = (uint32_t)((fn >> 4) ^ (fn >> 10)) & 63u;
+    if (__builtin_expect(t_kcache[ci].fn == fn, 1)) return t_kcache[ci].kind;
     uint32_t h = (uint32_t)((fn * 0x9E3779B97F4A7C15ull) >> (64 - KBITS));
     for (uint32_t k = 0; k < (1u << KBITS); k++, h = (h + 1) & ((1u << KBITS) - 1)) {
         uint64_t key = __atomic_load_n(&g_kinds[h].key, __ATOMIC_ACQUIRE);
-        if (key == fn) return g_kinds[h].kind;
+        if (key == fn) { int kd = g_kinds[h].kind; t_kcache[ci].fn = fn; t_kcache[ci].kind = kd; return kd; }
         if (!key) break;
     }
     /* first call of this method: `this` is the object it is called on */
@@ -87,16 +90,32 @@ static int kind_of(CPU *c, uint64_t fn)
         }
     }
     pthread_mutex_unlock(&g_kmu);
+    t_kcache[ci].fn = fn; t_kcache[ci].kind = kind;
     if (kind != NK_GENERIC && w64_trace) w64_log("[native] %#llx kind %d", (unsigned long long)fn, kind);
     return kind;
 }
 
+typedef uint64_t (*ncall4_t)(uint64_t, uint64_t, uint64_t, uint64_t);
+typedef uint64_t (*ncall8_t)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 typedef uint64_t (*ncall_t)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
                             uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 
 void w64_native_call(CPU *c, uint64_t fn)
 {
+    __atomic_fetch_add(&g_w64_com_calls, 1, __ATOMIC_RELAXED);
     int kind = kind_of(c, fn);
+    if (__builtin_expect(kind == NK_REG4, 1)) {
+        c->rax = ((ncall4_t)(uintptr_t)fn)(c->rcx, c->rdx, c->r8, c->r9);
+        c->rsp += 8;
+        return;
+    }
+    if (__builtin_expect(kind == NK_REG8, 0)) {
+        uint64_t sp = c->rsp;
+        c->rax = ((ncall8_t)(uintptr_t)fn)(c->rcx, c->rdx, c->r8, c->r9,
+                                           rd64(sp + 0x28), rd64(sp + 0x30), rd64(sp + 0x38), rd64(sp + 0x40));
+        c->rsp += 8;
+        return;
+    }
     switch (kind) {
     case NK_CLEAR_DSV:          /* (this, dsv, UINT flags, FLOAT depth, UINT8 stencil) */
         ((void (*)(void *, void *, uint32_t, float, uint8_t))(uintptr_t)fn)(AP(0), AP(1), AU(2), c->xmm[3].f32[0], (uint8_t)A(4));

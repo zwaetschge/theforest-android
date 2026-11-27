@@ -93,6 +93,7 @@ public class Launcher extends Activity {
         importDir(this).mkdirs();
         userDir(this).mkdirs();
         ensureMonoBcl(this, userDir(this));
+        QualityPreset.ensureDefault(this, userDir(this));
 
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
@@ -147,6 +148,17 @@ public class Launcher extends Activity {
         fullRes.setOnCheckedChangeListener((v, on) ->
                 getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(PREF_FULL_RES, on).apply());
         col.addView(fullRes);
+
+        Button presetBtn = new Button(this);
+        presetBtn.setText("Mobil-Grafik-Preset anwenden (30–60 FPS, scharfe Texturen + FXAA)");
+        presetBtn.setOnClickListener(v -> {
+            boolean ok = QualityPreset.applyMobilePreset(userDir(this));
+            status.setText(ok ? "Mobil-Grafik-Preset angewendet (jederzeit im Spiel unter OPTIONS → GRAPHICS anpassbar)."
+                    : "Mobil-Grafik-Preset konnte nicht gespeichert werden.");
+        });
+        LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        plp.topMargin = dp(8);
+        col.addView(presetBtn, plp);
 
         TextView help = new TextView(this);
         help.setTextColor(Color.rgb(145, 165, 150));

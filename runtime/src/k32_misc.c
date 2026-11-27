@@ -188,7 +188,11 @@ static void env_init(void)
         "USERPROFILE=C:\\Users\\Player", "APPDATA=C:\\Users\\Player\\AppData\\Roaming",
         "LOCALAPPDATA=C:\\Users\\Player\\AppData\\Local", "TEMP=C:\\Temp", "TMP=C:\\Temp", "USERNAME=Player",
         "COMPUTERNAME=PLUM", "OS=Windows_NT", "SystemRoot=C:\\Windows", "windir=C:\\Windows",
+#ifdef __ANDROID__
+        "PROCESSOR_ARCHITECTURE=AMD64", "NUMBER_OF_PROCESSORS=4", "HOMEDRIVE=C:", "HOMEPATH=\\Users\\Player", NULL
+#else
         "PROCESSOR_ARCHITECTURE=AMD64", "NUMBER_OF_PROCESSORS=8", "HOMEDRIVE=C:", "HOMEPATH=\\Users\\Player", NULL
+#endif
     };
     for (int i = 0; defs[i]; i++) g_env[g_nenv++] = strdup(defs[i]);
     const char *extra = getenv("W64_ENV");        /* "A=1;B=2" */
@@ -307,7 +311,14 @@ static void sysinfo(uint8_t *b)
     uint16_t arch = 9; memcpy(b, &arch, 2);
     uint32_t page = 4096; memcpy(b + 4, &page, 4);
     uint64_t lo = 0x10000, hi = 0x00007FFFFFFEFFFFull; memcpy(b + 8, &lo, 8); memcpy(b + 16, &hi, 8);
-    long n = sysconf(_SC_NPROCESSORS_ONLN); if (n < 1) n = 1; if (n > 32) n = 32;
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+#ifdef __ANDROID__
+    /* Cap default Unity/PhysX worker threads on big.LITTLE mobile SoCs to avoid
+     * futex contention and scheduling stalls on efficiency cores (override via W64_NCPU). */
+    if (n > 4) n = 4;
+#endif
+    { const char *e = getenv("W64_NCPU"); if (e && atoi(e) > 0) n = atoi(e); }
+    if (n < 1) n = 1; if (n > 32) n = 32;
     uint64_t mask = (n >= 64) ? ~0ull : ((1ull << n) - 1); memcpy(b + 24, &mask, 8);
     uint32_t np = (uint32_t)n; memcpy(b + 32, &np, 4);
     uint32_t pt = 8664; memcpy(b + 36, &pt, 4);

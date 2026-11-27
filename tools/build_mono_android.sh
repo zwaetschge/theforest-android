@@ -23,7 +23,7 @@ export AR="$TC/llvm-ar"
 export RANLIB="$TC/llvm-ranlib"
 export STRIP="$TC/llvm-strip"
 export LD="$TC/ld.lld"
-export CFLAGS="-O2 -fPIC -fno-strict-aliasing -fwrapv -DANDROID -D__ANDROID__ -Wno-error -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-function-pointer-types"
+export CFLAGS="-O3 -march=armv8.2-a -fPIC -fno-strict-aliasing -fwrapv -DANDROID -D__ANDROID__ -Wno-error -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-function-pointer-types"
 export CXXFLAGS="$CFLAGS"
 export LDFLAGS="-Wl,-z,max-page-size=16384"
 
