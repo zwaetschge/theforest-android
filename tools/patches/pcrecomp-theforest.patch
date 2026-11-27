@@ -1,0 +1,736 @@
+diff --git a/tools/lift/generate64.py b/tools/lift/generate64.py
+index ee47c89..74148ab 100644
+--- a/tools/lift/generate64.py
++++ b/tools/lift/generate64.py
+@@ -48,6 +48,9 @@ import time
+ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+ 
+ import lift64_cpu
++
++# Executable sections (House Party: IL2CPP code lives in 'il2cpp' right after '.text').
++EXEC_SECS = set()
+ from lift64_cpu import Lifter, load_bounds
+ 
+ # Sentinel addresses for imports. Chosen far above any plausible image (this one
+@@ -75,6 +78,8 @@ def read_pe(path):
+     for i in range(nsec):
+         n, vs, va, rs, ra = struct.unpack_from('<8sIIII', data, off + i * 40)
+         secs.append((n.rstrip(b'\0').decode(), va, vs, ra, rs))
++        if struct.unpack_from('<I', data, off + i * 40 + 36)[0] & 0x20000000:   # IMAGE_SCN_MEM_EXECUTE
++            EXEC_SECS.add(n.rstrip(b'\0').decode())
+     # data directory 1 is the import table; 12 is the IAT
+     ddoff = opt + 112
+     imp_rva, imp_sz = struct.unpack_from('<II', data, ddoff + 8)
+@@ -196,7 +201,7 @@ def jmp_thunks(data, base, secs, text_lo, text_hi):
+     """
+     found = set()
+     for name, va, size in ((s[0], base + s[1], s[2]) for s in secs):
+-        if name != '.text':
++        if name not in EXEC_SECS:
+             continue
+         off = rva_to_off(secs, va - base)
+         if off is None:
+@@ -230,9 +235,18 @@ def plausible_code(read_va, va):
+         from capstone import Cs, CS_ARCH_X86, CS_MODE_64
+         _CODE_MD = Cs(CS_ARCH_X86, CS_MODE_64)
+     try:
+-        code = read_va(va, 16)
++        code = read_va(va, 48)
+     except Exception:
+         return False
++    # Mewgenics: 16 bytes cut a leaf function whose first two loads are 7 bytes each
++    # (0x1408E3C20); and an entry right after int3/ret padding is a function start.
++    try:
++        prev = read_va(va - 1, 1)[0]
++    except Exception:
++        prev = None
++    first = next(iter(_CODE_MD.disasm(code, va)), None)
++    if prev in (0xCC, 0xC3) and first is not None and first.mnemonic != 'int3' and code[:2] != b'\x00\x00':
++        return True
+     n = 0
+     for ins in _CODE_MD.disasm(code, va):
+         if ins.mnemonic in ('int3', 'in', 'out', 'hlt', 'iretd', 'iretq',
+@@ -241,9 +255,77 @@ def plausible_code(read_va, va):
+         n += 1
+         if n >= 3:
+             return True
++        # Mewgenics: atexit destructor thunks are "lea rcx, [obj]; jmp dtor" followed by
++        # int3 padding (0x140E3CF00), and empty ones are a lone "ret 0" (0x140E3E618),
++        # right after the previous thunk's jmp. A one- or two-instruction sequence ending
++        # in an unconditional jmp/ret right before padding or a 16-byte boundary is a
++        # complete function.
++        if n <= 2 and ins.mnemonic in ('jmp', 'ret'):
++            end = ins.address + ins.size
++            nxt = code[end - va] if end - va < len(code) else None
++            if nxt == 0xCC or end % 16 == 0:
++                return True
+     return False
+ 
+ 
++def fh4_read_unsigned(data, p):
++    """__CxxFrameHandler4 compressed unsigned: the low bits of the first byte give the length."""
++    lb = data[p] & 0x0F
++    n = (1, 2, 1, 3, 1, 2, 1, 4, 1, 2, 1, 3, 1, 2, 1, 5)[lb]
++    sh = (25, 18, 25, 11, 25, 18, 25, 4, 25, 18, 25, 11, 25, 18, 25, 0)[lb]
++    return struct.unpack_from('<I', data, p + n - 4)[0] >> sh, p + n
++
++
++def fh4_funcinfo(data, secs, fi):
++    """FuncInfo4 at RVA fi -> dict(try_rva=..., catch_funclets=[rva...]) or None if it does not parse."""
++    fo = rva_to_off(secs, fi)
++    if fo is None:
++        return None
++    try:
++        hdr = data[fo]; p = fo + 1
++        if hdr & 0x80:                                   # reserved bit: not a FuncInfo4
++            return None
++        if hdr & 0x04:                                   # BBT
++            _, p = fh4_read_unsigned(data, p)
++        if hdr & 0x08:                                   # UnwindMap
++            p += 4
++        trymap = None
++        if hdr & 0x10:                                   # TryBlockMap
++            trymap = struct.unpack_from('<i', data, p)[0]; p += 4
++        funclets = []
++        if trymap:
++            to = rva_to_off(secs, trymap)
++            if to is None:
++                return None
++            ntry, q = fh4_read_unsigned(data, to)
++            if ntry > 4096:
++                return None
++            for _ in range(ntry):
++                _lo, q = fh4_read_unsigned(data, q)
++                _hi, q = fh4_read_unsigned(data, q)
++                _ch, q = fh4_read_unsigned(data, q)
++                ha = struct.unpack_from('<i', data, q)[0]; q += 4
++                ho = rva_to_off(secs, ha)
++                if ho is None:
++                    return None
++                nh, r = fh4_read_unsigned(data, ho)
++                if nh > 256:
++                    return None
++                for _ in range(nh):
++                    h = data[r]; r += 1
++                    if h & 1: _, r = fh4_read_unsigned(data, r)          # adjectives
++                    if h & 2: r += 4                                    # dispType
++                    if h & 4: _, r = fh4_read_unsigned(data, r)          # dispCatchObj
++                    funclets.append(struct.unpack_from('<i', data, r)[0]); r += 4
++                    ncont = (h >> 4) & 3
++                    for _ in range(ncont):
++                        if h & 8: r += 4
++                        else: _, r = fh4_read_unsigned(data, r)
++        return {'try': trymap, 'funclets': funclets}
++    except (struct.error, IndexError):
++        return None
++
++
+ def eh_tables(data, base, secs):
+     """Function starts that had a C++ try/catch, and the catch funclets.
+ 
+@@ -263,6 +345,10 @@ def eh_tables(data, base, secs):
+         o = rva_to_off(secs, rva)
+         return struct.unpack_from('<I', data, o)[0] if o is not None else 0
+ 
++    fh4_cands = {}                                     # handler rva -> [(begin, funcinfo rva)]
++    pd_begins = set()
++    for i in range(pd_size // 12):
++        pd_begins.add(struct.unpack_from('<I', data, off + 12 * i)[0])
+     for i in range(pd_size // 12):
+         begin, end, unwind = struct.unpack_from('<III', data, off + 12 * i)
+         seen = 0
+@@ -289,6 +375,8 @@ def eh_tables(data, base, secs):
+             # 0x1993052x is MSVC's; any other personality routine keeps its own
+             # shape behind that pointer and is not ours to read.
+             if magic & 0xfffffff0 != 0x19930520:
++                # maybe __CxxFrameHandler4 (compressed FuncInfo4, no magic): decided per handler below
++                fh4_cands.setdefault(u32(tail), []).append((begin, fi))
+                 break
+             starts.add(base + begin)
+             to = rva_to_off(secs, trymap)
+@@ -304,6 +392,25 @@ def eh_tables(data, base, secs):
+                     if hv:
+                         handlers.add(base + hv)
+             break
++    # House Party (IL2CPP, MSVC 2019+): most EH functions use __CxxFrameHandler4. A handler counts as
++    # FH4 when the FuncInfo4 of nearly every function that has a try block parses and names catch
++    # funclets that are real .pdata function starts.
++    fh4_funcs = 0
++    for h, fns in fh4_cands.items():
++        parsed = [(b, fh4_funcinfo(data, secs, fi)) for b, fi in fns]
++        withtry = [(b, r) for b, r in parsed if r and r['try']]
++        if len(withtry) < 3:
++            continue
++        good = [(b, r) for b, r in withtry if r['funclets'] and all(f in pd_begins for f in r['funclets'])]
++        if len(good) < 0.95 * len(withtry):
++            continue
++        for b, r in good:
++            starts.add(base + b)
++            for f in r['funclets']:
++                handlers.add(base + f)
++        fh4_funcs += len(good)
++        print('[*] FH4 handler %#x: %d functions with try blocks (%d with handler data)'
++              % (base + h, len(good), len(fns)))
+     return frozenset(starts), frozenset(handlers)
+ 
+ 
+@@ -362,15 +469,17 @@ def main():
+                     'void %s(CPU *c) { (void)c; RECOMP_TODO(%#x, "lift error"); }'
+                     % (name, va, e, fname, va))
+ 
+-    text_lo = base + [s for s in secs if s[0] == '.text'][0][1]
+-    text_hi = text_lo + [s for s in secs if s[0] == '.text'][0][2]
++    # One code range over all executable sections (contiguous apart from padding).
++    _ex = [s for s in secs if s[0] in EXEC_SECS] or [s for s in secs if s[0] == '.text']
++    text_lo = base + min(s[1] for s in _ex)
++    text_hi = base + max(s[1] + s[2] for s in _ex)
+ 
+     # Stored code pointers first: these are entries the disassembler could not
+     # have found, and adding them before the closure loop means their own
+     # dispatch targets get closed over too.
+     ptrs = reloc_code_pointers(data, base, secs, reloc_rva, reloc_sz,
+                                text_lo, text_hi)
+-    starts = sorted(bounds)
++    starts = sorted(set(bounds) | ptrs)
+     added_ptr = 0
+     for t in sorted(ptrs):
+         if t in bounds:
+@@ -403,7 +512,7 @@ def main():
+     # that had handlers are marked so the lifter gives them a landing pad.
+     eh_starts, eh_handlers = eh_tables(data, base, secs)
+     lf.eh_funcs = eh_starts
+-    starts = sorted(bounds)
++    starts = sorted(set(bounds) | eh_handlers)
+     added_eh = 0
+     for t in sorted(eh_handlers):
+         if t in bounds:
+@@ -443,7 +552,7 @@ def main():
+         lf.lea_targets.clear()
+ 
+         known = set(bounds)
+-        starts = sorted(known)
++        starts = sorted(known | {t for t in targets if text_lo <= t < text_hi})
+         new = []
+         for t in sorted(targets):
+             if t in known or not (text_lo <= t < text_hi):
+diff --git a/tools/lift/lift64_cpu.py b/tools/lift/lift64_cpu.py
+index 7bbe9ab..cdcb7d5 100644
+--- a/tools/lift/lift64_cpu.py
++++ b/tools/lift/lift64_cpu.py
+@@ -183,7 +183,7 @@ SSE64_EXTRA = (
+     frozenset(PACKED_ARITH) | frozenset(PACKED_MINMAX)
+     | frozenset({'shufps', 'shufpd', 'unpcklps', 'unpckhps',
+                  'unpcklpd', 'unpckhpd', 'movhlps', 'movlhps',
+-                 'movmskps', 'movmskpd', 'sqrtps', 'rcpps',
++                 'movmskps', 'movmskpd', 'sqrtps', 'sqrtpd', 'pmuludq', 'cvtpd2dq', 'cvttpd2dq', 'rcpps',
+                  'rsqrtps', 'rsqrtss', 'rcpss', 'cvtdq2pd',
+                  'movlps', 'movhps', 'movlpd', 'movhpd',
+                  'cvtsi2ssl', 'cvtsi2sdl', 'cvtsi2ssq', 'cvtsi2sdq',
+@@ -279,7 +279,7 @@ SSE64_MOV128 = frozenset({'movntdqa', 'lddqu'})
+ 
+ PINTEGER_MISC = frozenset({
+     'pmullw', 'pmulhw', 'pmulhuw', 'pmaddwd', 'pavgb', 'pavgw',
+-    'pmovmskb', 'pslldq', 'psrldq', 'pextrw', 'pinsrw', 'pshufb',
++    'pmovmskb', 'pslldq', 'psrldq', 'pextrw', 'pinsrw', 'pshufb', 'psadbw',
+ })
+ 
+ SSE64_MNEMONICS = (SSE_MNEMONICS | SSE64_EXTRA
+@@ -289,6 +289,33 @@ SSE64_MNEMONICS = (SSE_MNEMONICS | SSE64_EXTRA
+                    | SSE64_MOV128)
+ 
+ 
++class _HintlessInsn:
++    """A capstone instruction whose `bnd ` / `notrack ` prefix is dropped from the mnemonic.
++
++    MSVC's CET/MPX-compatible helpers (__chkstk: `bnd jae`, `bnd ret`) carry these hint prefixes;
++    they change nothing about what the instruction does, but every check of the mnemonic
++    (branch labels, the jcc/ret translation) would otherwise miss the branch."""
++    __slots__ = ('_i', 'mnemonic')
++
++    def __init__(self, i, m):
++        self._i = i
++        self.mnemonic = m
++
++    def __getattr__(self, a):
++        return getattr(self._i, a)
++
++
++def _strip_hint_prefixes(insns):
++    out = []
++    for i in insns:
++        m = i.mnemonic
++        if m.startswith('bnd ') or m.startswith('notrack '):
++            out.append(_HintlessInsn(i, m.split(' ', 1)[1]))
++        else:
++            out.append(i)
++    return out
++
++
+ class Lifter:
+     def __init__(self, image_size, read_va=None, image_base=None):
+         self.image_lo = IMAGE_BASE if image_base is None else image_base
+@@ -477,6 +504,179 @@ class Lifter:
+             'jrcxz': '(c->rcx == 0)', 'jecxz': '(R32(c->rcx) == 0)',
+         }.get(m)
+ 
++    # ---- MMX --------------------------------------------------------------
++    # House Party (UnityPlayer's image scalers) runs MMX. mm0-7 are CPU state of their own here
++    # (c->mm[], XMM-typed, low 64 bits used); the x87 aliasing does not matter because x87 is not
++    # modelled. Same lane semantics as the SSE forms at half the width - written out separately
++    # because the "high" unpacks and the packs are not the low half of their 128-bit versions.
++    def _is_mm(self, op):
++        return op.type == X86_OP_REG and re.fullmatch(r'mm[0-7]', self.rname(op.reg)) is not None
++
++    def is_mmx(self, insn):
++        return insn.mnemonic in ('emms', 'femms') or any(self._is_mm(o) for o in insn.operands)
++
++    def _mi(self, op):
++        if not self._is_mm(op):
++            raise NotImplementedError('not an mm operand')
++        return int(self.rname(op.reg)[2:])
++
++    def _mv(self, insn, op):
++        if self._is_mm(op):
++            return 'c->mm[%d]' % self._mi(op)
++        if op.type == X86_OP_MEM:
++            return 'rdmm(%s)' % self.addr_expr(insn, op)
++        raise NotImplementedError('mmx source')
++
++    def mmx(self, insn):
++        m = insn.mnemonic
++        ops = insn.operands
++        ea = insn.address
++        if m in ('emms', 'femms'):
++            return ['/* emms: x87 tag word not modelled */']
++        d = ops[0]
++        s = ops[1] if len(ops) > 1 else None
++        lanes = {'u8': 8, 'i8': 8, 'u16': 4, 'i16': 4, 'u32': 2, 'i32': 2, 'u64': 1}
++
++        def two(body_fmt, fld, k):
++            n = lanes[fld]
++            out = ['{ XMM _d = c->mm[%d], _s = %s;' % (k, self._mv(insn, s))]
++            for i in range(n):
++                out.append(body_fmt % {'k': k, 'i': i, 'f': fld})
++            out.append(' }')
++            return [''.join(out)]
++
++        if m in ('movd', 'movq', 'movntq'):
++            if self._is_mm(d):
++                k = self._mi(d)
++                if s.type == X86_OP_REG and self._is_mm(s):
++                    return ['c->mm[%d].u64[0] = c->mm[%d].u64[0];' % (k, self._mi(s))]
++                if s.type == X86_OP_REG and self._is_xmm(s):
++                    return ['c->mm[%d].u64[0] = c->xmm[%d].u64[0];' % (k, self._xi(s))]
++                if m == 'movd':
++                    return ['c->mm[%d].u64[0] = (uint32_t)(%s); c->mm[%d].u64[1] = 0;' % (k, self.src(insn, s), k)]
++                if s.type == X86_OP_REG:
++                    return ['c->mm[%d].u64[0] = %s; c->mm[%d].u64[1] = 0;' % (k, reg_read(self.rname(s.reg)), k)]
++                return ['c->mm[%d].u64[0] = rd64(%s); c->mm[%d].u64[1] = 0;' % (k, self.addr_expr(insn, s), k)]
++            j = self._mi(s)
++            if m == 'movd':
++                return [self.dst_write(insn, d, 'c->mm[%d].u32[0]' % j)]
++            if d.type == X86_OP_REG and self._is_xmm(d):
++                return ['c->xmm[%d].u64[0] = c->mm[%d].u64[0]; c->xmm[%d].u64[1] = 0;' % (self._xi(d), j, self._xi(d))]
++            if d.type == X86_OP_REG:
++                return [reg_write(self.rname(d.reg), 'c->mm[%d].u64[0]' % j)]
++            return ['wr64(%s, c->mm[%d].u64[0]);' % (self.addr_expr(insn, d), j)]
++        if m == 'movq2dq':
++            return ['c->xmm[%d].u64[0] = c->mm[%d].u64[0]; c->xmm[%d].u64[1] = 0;' % (self._xi(d), self._mi(s), self._xi(d))]
++        if m == 'movdq2q':
++            return ['c->mm[%d].u64[0] = c->xmm[%d].u64[0];' % (self._mi(d), self._xi(s))]
++
++        k = self._mi(d) if self._is_mm(d) else None
++        if m in ('pand', 'por', 'pxor', 'pandn'):
++            expr = {'pand': '_d.u64[0] & _s.u64[0]', 'por': '_d.u64[0] | _s.u64[0]',
++                    'pxor': '_d.u64[0] ^ _s.u64[0]', 'pandn': '~_d.u64[0] & _s.u64[0]'}[m]
++            return ['{ XMM _d = c->mm[%d], _s = %s; c->mm[%d].u64[0] = %s; }' % (k, self._mv(insn, s), k, expr)]
++        if m in PLANE:
++            fld, _n, op = PLANE[m]
++            return two(' c->mm[%%(k)d].%%(f)s[%%(i)d] = _d.%%(f)s[%%(i)d] %s _s.%%(f)s[%%(i)d];' % op, fld, k)
++        if m in PSAT:
++            fld, _n, _sg, add, lo, hi = PSAT[m]
++            cast = ('int%s_t' if fld[0] == 'i' else 'uint%s_t') % fld[1:]
++            body = (' { int64_t _v = (int64_t)_d.%%(f)s[%%(i)d] %s (int64_t)_s.%%(f)s[%%(i)d];'
++                    ' c->mm[%%(k)d].%%(f)s[%%(i)d] = (%s)(_v < %d ? %d : _v > %d ? %d : _v); }'
++                    % ('+' if add else '-', cast, lo, lo, hi, hi))
++            return two(body, fld, k)
++        if m in PCMP:
++            fld, _n, op = PCMP[m]
++            ufld = 'u' + fld[1:]
++            ones = (1 << {'u8': 8, 'i8': 8, 'u16': 16, 'i16': 16, 'u32': 32, 'i32': 32}[fld]) - 1
++            body = (' c->mm[%%(k)d].%s[%%(i)d] = (_d.%%(f)s[%%(i)d] %s _s.%%(f)s[%%(i)d]) ? UINT64_C(%d) : 0;'
++                    % (ufld, op, ones))
++            return two(body, fld, k)
++        if m in PMINMAX:
++            fld, _n, op = PMINMAX[m]
++            body = (' c->mm[%%(k)d].%%(f)s[%%(i)d] = _d.%%(f)s[%%(i)d] %s _s.%%(f)s[%%(i)d] ? _d.%%(f)s[%%(i)d] : _s.%%(f)s[%%(i)d];' % op)
++            return two(body, fld, k)
++        if m in ('pmullw', 'pmulhw', 'pmulhuw'):
++            fld = 'u16' if m == 'pmulhuw' else 'i16'
++            sh = 0 if m == 'pmullw' else 16
++            body = (' c->mm[%%(k)d].u16[%%(i)d] = (uint16_t)(((int32_t)_d.%%(f)s[%%(i)d] * (int32_t)_s.%%(f)s[%%(i)d]) >> %d);' % sh)
++            return two(body, fld, k)
++        if m == 'pmaddwd':
++            body = (' c->mm[%(k)d].i32[%(i)d] = (int32_t)_d.i16[2*%(i)d] * _s.i16[2*%(i)d] + (int32_t)_d.i16[2*%(i)d+1] * _s.i16[2*%(i)d+1];')
++            return two(body, 'i32', k)
++        if m in ('pavgb', 'pavgw'):
++            fld, cast = ('u8', 'uint8_t') if m == 'pavgb' else ('u16', 'uint16_t')
++            body = ' c->mm[%%(k)d].%%(f)s[%%(i)d] = (%s)(((uint32_t)_d.%%(f)s[%%(i)d] + _s.%%(f)s[%%(i)d] + 1) >> 1);' % cast
++            return two(body, fld, k)
++        if m == 'pmuludq':
++            return ['{ XMM _d = c->mm[%d], _s = %s; c->mm[%d].u64[0] = (uint64_t)_d.u32[0] * _s.u32[0]; }'
++                    % (k, self._mv(insn, s), k)]
++        if m == 'psadbw':
++            terms = ' + '.join('(_d.u8[%d] > _s.u8[%d] ? _d.u8[%d] - _s.u8[%d] : _s.u8[%d] - _d.u8[%d])' % ((i,) * 6) for i in range(8))
++            return ['{ XMM _d = c->mm[%d], _s = %s; c->mm[%d].u64[0] = (uint64_t)(%s); }' % (k, self._mv(insn, s), k, terms)]
++        if m == 'pshufw':
++            imm = ops[2].imm & 0xFF
++            out = ['{ XMM _s = %s;' % self._mv(insn, s)]
++            for i in range(4):
++                out.append(' c->mm[%d].u16[%d] = _s.u16[%d];' % (k, i, (imm >> (2 * i)) & 3))
++            out.append(' }')
++            return [''.join(out)]
++        if m == 'pextrw':
++            return [self.dst_write(insn, d, '(uint32_t)c->mm[%d].u16[%d]' % (self._mi(s), ops[2].imm & 3))]
++        if m == 'pinsrw':
++            return ['c->mm[%d].u16[%d] = (uint16_t)(%s);' % (k, ops[2].imm & 3, self.src(insn, s))]
++        if m == 'pmovmskb':
++            j = self._mi(s)
++            expr = ' | '.join('((uint32_t)(c->mm[%d].u8[%d] >> 7) << %d)' % (j, i, i) for i in range(8))
++            return [self.dst_write(insn, d, '(%s)' % expr)]
++        if m in PUNPCK:
++            fld, n128, base128 = PUNPCK[m]
++            n = lanes[fld] // 2
++            base = 0 if base128 == 0 else n
++            # the low forms read m32, not m64 (an 8-byte read can cross into an unmapped page)
++            src = ('rdmm32(%s)' % self.addr_expr(insn, s)) if (base == 0 and s.type == X86_OP_MEM) else self._mv(insn, s)
++            out = ['{ XMM _d = c->mm[%d], _s = %s;' % (k, src)]
++            for i in range(n):
++                out.append(' c->mm[%d].%s[%d] = _d.%s[%d];' % (k, fld, 2 * i, fld, base + i))
++                out.append(' c->mm[%d].%s[%d] = _s.%s[%d];' % (k, fld, 2 * i + 1, fld, base + i))
++            out.append(' }')
++            return [''.join(out)]
++        if m in PACK:
++            sf, df, _n, lo, hi = PACK[m]
++            n = lanes[sf]
++            cast = ('int%s_t' if df[0] == 'i' else 'uint%s_t') % df[1:]
++            out = ['{ XMM _d = c->mm[%d], _s = %s; int64_t _v;' % (k, self._mv(insn, s))]
++            for i in range(2 * n):
++                src, j = ('_d', i) if i < n else ('_s', i - n)
++                out.append(' _v = %s.%s[%d]; c->mm[%d].%s[%d] = (%s)(_v < %d ? %d : _v > %d ? %d : _v);'
++                           % (src, sf, j, k, df, i, cast, lo, lo, hi, hi))
++            out.append(' }')
++            return [''.join(out)]
++        if m in PSHIFT:
++            fld, _n, kind = PSHIFT[m]
++            if s.type == X86_OP_IMM:
++                cnt = 'UINT64_C(%d)' % (s.imm & 0xFF)
++            elif self._is_mm(s):
++                cnt = 'c->mm[%d].u64[0]' % self._mi(s)
++            elif s.type == X86_OP_MEM:
++                cnt = 'rd64(%s)' % self.addr_expr(insn, s)
++            else:
++                return [_todo(ea, '%s %s' % (m, insn.op_str))]
++            width = {'u16': 16, 'i16': 16, 'u32': 32, 'i32': 32, 'u64': 64}[fld]
++            out = ['{ uint64_t _n = %s;' % cnt]
++            if kind == 'a':
++                out.append(' if (_n > %d) _n = %d;' % (width - 1, width - 1))
++                body = ' c->mm[%d].%s[%%d] = (%s)(c->mm[%d].%s[%%d] >> _n);' % (k, fld, fld.replace('i', 'int') + '_t', k, fld)
++            else:
++                out.append(' if (_n > %d) _n = %d;' % (width, width))
++                op = '<<' if kind == 'l' else '>>'
++                body = ' c->mm[%d].%s[%%d] = _n == %d ? 0 : (c->mm[%d].%s[%%d] %s _n);' % (k, fld, width, k, fld, op)
++            for i in range(lanes[fld]):
++                out.append(body % (i, i))
++            out.append(' }')
++            return [''.join(out)]
++        return [_todo(ea, '%s %s (MMX form not modelled)' % (m, insn.op_str))]
++
+     # ---- SSE --------------------------------------------------------------
+     def _is_xmm(self, op):
+         return op.type == X86_OP_REG and self.rname(op.reg).startswith('xmm')
+@@ -594,6 +794,17 @@ class Lifter:
+             out.append(' }')
+             return [''.join(out)]
+ 
++        if m == 'psadbw':
++            # sum of absolute byte differences per 64-bit half, into its low word
++            k = self._xi(d)
++            out = ['{ XMM _d = c->xmm[%d], _s = %s;' % (k, self._xm(insn, s))]
++            for h in range(2):
++                terms = ' + '.join('(_d.u8[%d] > _s.u8[%d] ? _d.u8[%d] - _s.u8[%d] : _s.u8[%d] - _d.u8[%d])'
++                                   % ((8 * h + i,) * 6) for i in range(8))
++                out.append(' c->xmm[%d].u64[%d] = (uint64_t)(%s);' % (k, h, terms))
++            out.append(' }')
++            return [''.join(out)]
++
+         if m == 'pmaddwd':
+             k = self._xi(d)
+             out = ['{ XMM _d = c->xmm[%d], _s = %s;' % (k, self._xm(insn, s))]
+@@ -821,6 +1032,16 @@ class Lifter:
+             rd_ = self._sd if wide else self._ss
+             return ['%s = %s(%s);' % (rd_(insn, d), 'sqrt' if wide else 'sqrtf',
+                                       rd_(insn, s))]
++        if m == 'sqrtpd':
++            n = self._xi(d)
++            body = ' '.join('c->xmm[%d].f64[%d] = sqrt(_s.f64[%d]);' % (n, i, i)
++                            for i in range(2))
++            return ['{ XMM _s = %s; %s }' % (self._xm(insn, s), body)]
++        if m == 'pmuludq':
++            n = self._xi(d)
++            body = ' '.join('c->xmm[%d].u64[%d] = (uint64_t)_d.u32[%d] * (uint64_t)_s.u32[%d];'
++                            % (n, i, 2*i, 2*i) for i in range(2))
++            return ['{ XMM _d = c->xmm[%d], _s = %s; %s }' % (n, self._xm(insn, s), body)]
+         if m == 'sqrtps':
+             n = self._xi(d)
+             body = ' '.join('c->xmm[%d].f32[%d] = sqrtf(_s.f32[%d]);' % (n, i, i)
+@@ -850,8 +1071,11 @@ class Lifter:
+             return ['sse_compare(c, %s, %s);' % (rd_(insn, d), rd_(insn, s))]
+ 
+         # ---- compares that write a mask ----
++        # SSE_CMP_RE (shared with the 32-bit lifter) matches the packed forms too; they are the
++        # PACKED_CMP_RE branch below - taking them here computed lane 0 only (House Party's
++        # animation got non-unit quaternions from every cmpps mask).
+         mm = SSE_CMP_RE.match(m)
+-        if mm:
++        if mm and mm.group(2) in ('ss', 'sd'):
+             pred, width = mm.group(1), mm.group(2)
+             wide = width == 'sd'
+             rd_ = self._sd if wide else self._ss
+@@ -961,6 +1185,13 @@ class Lifter:
+                                 % (n, i, i))
+             return ['{ XMM _s = %s; %s }' % (self._xm(insn, s), ' '.join(body))]
+ 
++        if m in ('cvtpd2dq', 'cvttpd2dq'):
++            n = self._xi(d)
++            r = 'nearbyint(_s.f64[%d])' if m == 'cvtpd2dq' else '_s.f64[%d]'
++            return ['{ XMM _s = %s; c->xmm[%d].i32[0] = sse_cvtt_i32(%s); c->xmm[%d].i32[1] = sse_cvtt_i32(%s);'
++                    ' c->xmm[%d].i32[2] = 0; c->xmm[%d].i32[3] = 0; }'
++                    % (self._xm(insn, s), n, r % 0, n, r % 1, n, n)]
++
+         if m == 'cvtdq2pd':
+             # Two ints from the LOW 64 bits, two doubles out.
+             n = self._xi(d)
+@@ -1006,8 +1237,36 @@ class Lifter:
+         ea = insn.address
+         nxt = insn.address + insn.size
+ 
+-        if m.startswith('lock '):
++        locked = m.startswith('lock ')
++        if locked:
+             m = m[5:]
++        # A LOCKed read-modify-write is atomic on x86 and other threads rely on
++        # it (reference counts, spin locks). Lifted as a plain load and store it
++        # races - and clang may even keep the value in a register across a spin
++        # loop. So: real host atomics, flags from the old value.
++        if locked and ops and ops[0].type == X86_OP_MEM and ops[0].size in (1, 2, 4, 8) and \
++                m in ('add', 'sub', 'and', 'or', 'xor', 'inc', 'dec'):
++            d = ops[0]
++            sz = d.size
++            w = 8 * sz
++            ptr = '(uint%d_t *)(uintptr_t)(%s)' % (w, self.addr_expr(insn, d))
++            if m in ('inc', 'dec'):
++                fn = 'flags_incs' if m == 'inc' else 'flags_decs'
++                op = '__atomic_fetch_add' if m == 'inc' else '__atomic_fetch_sub'
++                return ['{ uint%d_t _o = %s(%s, 1, __ATOMIC_SEQ_CST); %s(c, _o, %d); }' % (w, op, ptr, fn, sz)]
++            v = self.src_ext(insn, ops[1], sz)
++            op = {'add': '__atomic_fetch_add', 'sub': '__atomic_fetch_sub', 'and': '__atomic_fetch_and',
++                  'or': '__atomic_fetch_or', 'xor': '__atomic_fetch_xor'}[m]
++            if m == 'add':
++                fl = 'flags_add(c, _o, _v, %d);' % sz
++            elif m == 'sub':
++                fl = 'flags_sub(c, _o, _v, %d);' % sz
++            else:
++                fl = 'flags_logicz(c, _o %s _v, %d);' % ({'and': '&', 'or': '|', 'xor': '^'}[m], sz)
++            return ['{ uint%d_t _v = (uint%d_t)(%s); uint%d_t _o = %s(%s, _v, __ATOMIC_SEQ_CST); %s }'
++                    % (w, w, v, w, op, ptr, fl)]
++        if m == 'pause':
++            return ['w64_cpu_relax();']
+ 
+         # An F3/F2 prefix is only a REP on a string instruction. On anything
+         # else it is a hint, and the one that matters is `repz ret` (F3 C3) -
+@@ -1025,8 +1284,22 @@ class Lifter:
+         def sz0():
+             return ops[0].size
+ 
+-        # x87 and MMX are not modelled - see the module docstring. Caught here
+-        # so they cannot fall through into a same-named integer handler.
++        # x87 control bookkeeping (Mewgenics: the CRT's setjmp/longjmp save and
++        # restore the control word next to MXCSR). No x87 arithmetic runs, so like
++        # stmxcsr/ldmxcsr above: report the x64 default control word, ignore loads.
++        if m in ('fnstcw', 'fstcw') and ops and ops[0].type == X86_OP_MEM:
++            return [self.wr(insn, ops[0], '0x027F')]
++        if m in ('fldcw', 'fnclex', 'fclex', 'fninit', 'finit', 'fwait', 'wait'):
++            return ['/* %s: x87 control state not modelled */' % m]
++
++        if self.is_mmx(insn):
++            try:
++                return self.mmx(insn)
++            except NotImplementedError as e:
++                return [_todo(ea, '%s %s [%s]' % (m, insn.op_str, e))]
++
++        # x87 is not modelled - see the module docstring. Caught here
++        # so it cannot fall through into a same-named integer handler.
+         if m[0] == 'f' and m not in ('fs',):
+             return [_todo(ea, '%s %s (x87 not modelled)' % (m, insn.op_str))]
+ 
+@@ -1057,7 +1330,7 @@ class Lifter:
+                         % (cond, self.dst_write(insn, d, self.src(insn, sop)))]
+ 
+         # ---- data movement ----
+-        if m in ('mov', 'movabs'):
++        if m in ('mov', 'movabs', 'movnti'):
+             d, s = two()
+             return [self.dst_write(insn, d, self.src_ext(insn, s, d.size))]
+         if m == 'lea':
+@@ -1141,6 +1414,11 @@ class Lifter:
+             fn = {'shl': 'op_shl', 'sal': 'op_shl', 'shr': 'op_shr', 'sar': 'op_sar'}[m]
+             return [self.dst_write(insn, d, '%s(c, %s, %s, %d)'
+                                    % (fn, self._read_dst(insn, d), cnt, d.size))]
++        if m in ('rcl', 'rcr'):
++            d = ops[0]
++            cnt = self.src(insn, ops[1]) if len(ops) > 1 else '1'
++            return [self.dst_write(insn, d, 'op_%s(c, %s, %s, %d)'
++                                   % (m, self._read_dst(insn, d), cnt, d.size))]
+         if m in ('rol', 'ror'):
+             d = ops[0]
+             cnt = self.src(insn, ops[1]) if len(ops) > 1 else '1'
+@@ -1158,12 +1436,29 @@ class Lifter:
+         if m in ('bt', 'bts', 'btr', 'btc'):
+             d, s = two()
+             fn = 'op_' + m
++            # A memory operand with a REGISTER bit offset addresses a bit string: the signed offset
++            # selects the operand-sized unit EA + (offset >> log2 W) * W/8. The CRT's strcspn and
++            # strpbrk build their 256-bit character sets with `bts dword ptr [rcx], eax`.
++            if d.type == X86_OP_MEM and s.type == X86_OP_REG and d.size in (2, 4, 8):
++                cast = {2: 'int16_t', 4: 'int32_t', 8: 'int64_t'}[d.size]
++                lg = {2: 4, 4: 5, 8: 6}[d.size]
++                rdf, wrf = 'rd%d' % (d.size * 8), 'wr%d' % (d.size * 8)
++                head = ('{ int64_t _o = (int64_t)(%s)(%s); uint64_t _a = (%s) + (uint64_t)((_o >> %d) * %d); '
++                        % (cast, self.src(insn, s), self.addr_expr(insn, d), lg, d.size))
++                if m == 'bt':
++                    return [head + 'op_bt(c, %s(_a), (uint64_t)_o, %d); }' % (rdf, d.size)]
++                return [head + '%s(_a, (uint%d_t)%s(c, %s(_a), (uint64_t)_o, %d)); }'
++                        % (wrf, d.size * 8, fn, rdf, d.size)]
+             if m == 'bt':
+                 return ['%s(c, %s, %s, %d);'
+                         % (fn, self._read_dst(insn, d), self.src(insn, s), d.size)]
+             return [self.dst_write(insn, d, '%s(c, %s, %s, %d)'
+                                    % (fn, self._read_dst(insn, d),
+                                       self.src(insn, s), d.size))]
++        if m in ('tzcnt', 'lzcnt'):
++            d, s = two()
++            return ['{ uint64_t _s = %s; uint64_t _r = op_%s(_s, %d); %s c->cf = (_s == 0); c->zf = (_r == 0); }'
++                    % (self.src(insn, s), m, s.size, self.dst_write(insn, d, '_r'))]
+         if m in ('bsf', 'bsr'):
+             d, s = two()
+             fn = 'op_' + m
+@@ -1197,12 +1492,42 @@ class Lifter:
+ 
+         if m == 'xchg':
+             d, s = two()
++            # with a memory operand xchg is implicitly locked
++            if d.type == X86_OP_MEM or s.type == X86_OP_MEM:
++                mem, reg = (d, s) if d.type == X86_OP_MEM else (s, d)
++                w = 8 * mem.size
++                return ['{ uint%d_t _o = __atomic_exchange_n((uint%d_t *)(uintptr_t)(%s), (uint%d_t)(%s), __ATOMIC_SEQ_CST); %s }'
++                        % (w, w, self.addr_expr(insn, mem), w, self.src(insn, reg), self.dst_write(insn, reg, '_o'))]
+             return ['{ uint64_t _t = %s; %s %s }'
+                     % (self._read_dst(insn, d),
+                        self.dst_write(insn, d, self.src(insn, s)),
+                        self.dst_write(insn, s, '_t'))]
+ 
+         # ---- interlocked ----
++        if m == 'cmpxchg' and sz0() in (1, 2) and ops[0].type == X86_OP_MEM:
++            d, s = two()
++            w = 8 * sz0()
++            acc = 'R8L(c->rax)' if w == 8 else 'R16(c->rax)'
++            setacc = 'SET8L(c->rax, _exp)' if w == 8 else 'SET16(c->rax, _exp)'
++            return ['{ uint%d_t _exp = (uint%d_t)%s, _old = _exp;' % (w, w, acc),
++                    '  int _ok = __atomic_compare_exchange_n((uint%d_t *)(uintptr_t)(%s), &_exp, (uint%d_t)(%s), 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);'
++                    % (w, self.addr_expr(insn, d), w, self.src(insn, s)),
++                    '  flags_sub(c, _old, _exp, %d); if (!_ok) %s; }' % (sz0(), setacc)]
++        # House Party: Unity's/baselib's lock-free stacks and queues (pointer + ABA counter).
++        if m == 'cmpxchg16b' and ops and ops[0].type == X86_OP_MEM:
++            a = self.addr_expr(insn, ops[0])
++            return ['{ unsigned __int128 _exp = ((unsigned __int128)c->rdx << 64) | c->rax;',
++                    '  unsigned __int128 _new = ((unsigned __int128)c->rcx << 64) | c->rbx;',
++                    '  int _ok = __atomic_compare_exchange_n((unsigned __int128 *)(uintptr_t)(%s), &_exp, _new, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);' % a,
++                    '  c->zf = _ok; if (!_ok) { c->rax = (uint64_t)_exp; c->rdx = (uint64_t)(_exp >> 64); } }']
++        if m == 'cmpxchg8b' and ops and ops[0].type == X86_OP_MEM:
++            a = self.addr_expr(insn, ops[0])
++            return ['{ uint64_t _exp = ((uint64_t)(uint32_t)c->rdx << 32) | (uint32_t)c->rax;',
++                    '  uint64_t _new = ((uint64_t)(uint32_t)c->rcx << 32) | (uint32_t)c->rbx;',
++                    '  int _ok = __atomic_compare_exchange_n((uint64_t *)(uintptr_t)(%s), &_exp, _new, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);' % a,
++                    '  c->zf = _ok; if (!_ok) { c->rax = (uint32_t)_exp; c->rdx = (uint32_t)(_exp >> 32); } }']
++        if m in ('sfence', 'lfence', 'mfence'):
++            return ['__atomic_thread_fence(__ATOMIC_SEQ_CST);']
+         if m in ('xadd', 'cmpxchg') and sz0() in (4, 8):
+             d, s = two()
+             sz = sz0()
+@@ -1247,6 +1572,12 @@ class Lifter:
+             return ['SET8H(c->rax, (uint8_t)((c->sf<<7)|(c->zf<<6)|(c->af<<4)'
+                     '|(c->pf<<2)|2|c->cf));']
+ 
++        if m == 'bswap':
++            d = ops[0]
++            if d.size == 8:
++                return [self.dst_write(insn, d, '__builtin_bswap64(%s)' % self._read_dst(insn, d))]
++            return [self.dst_write(insn, d, '(uint64_t)__builtin_bswap32((uint32_t)(%s))' % self._read_dst(insn, d))]
++
+         # ---- multiply / divide ----
+         if m == 'mul':
+             s = ops[0]
+@@ -1314,14 +1645,18 @@ class Lifter:
+                 # after setting rdx to the sign extension of rax (cqo) or to
+                 # zero, so the 64/64 form below is what actually runs. A genuine
+                 # 128-bit numerator would need __int128 and is caught, not guessed.
++                # 64/64 fast path when rdx is the sign/zero extension of rax,
++                # __int128 otherwise (both host compilers have it).
+                 if sg:
+-                    return ['{ int64_t _n=(int64_t)c->rax, _d=(int64_t)(%s);' % v,
+-                            '  if ((c->rdx != 0) && (c->rdx != ~(uint64_t)0))'
+-                            ' RECOMP_TODO(0x%X, "idiv: true 128-bit numerator");' % ea,
+-                            '  c->rax=(uint64_t)(_n/_d); c->rdx=(uint64_t)(_n%_d); }']
+-                return ['{ uint64_t _n=c->rax, _d=(uint64_t)(%s);' % v,
+-                        '  if (c->rdx != 0) RECOMP_TODO(0x%X, "div: true 128-bit numerator");' % ea,
+-                        '  c->rax=_n/_d; c->rdx=_n%_d; }']
++                    return ['{ int64_t _d=(int64_t)(%s);' % v,
++                            '  if (c->rdx == (uint64_t)((int64_t)c->rax >> 63)) {'
++                            ' int64_t _n=(int64_t)c->rax; c->rax=(uint64_t)(_n/_d); c->rdx=(uint64_t)(_n%_d); }',
++                            '  else { __int128 _n=(__int128)(((unsigned __int128)c->rdx<<64)|c->rax);'
++                            ' c->rax=(uint64_t)(_n/_d); c->rdx=(uint64_t)(_n%_d); } }']
++                return ['{ uint64_t _d=(uint64_t)(%s);' % v,
++                        '  if (c->rdx == 0) { uint64_t _n=c->rax; c->rax=_n/_d; c->rdx=_n%_d; }',
++                        '  else { unsigned __int128 _n=((unsigned __int128)c->rdx<<64)|c->rax;'
++                        ' c->rax=(uint64_t)(_n/_d); c->rdx=(uint64_t)(_n%_d); } }']
+             if sz == 4:
+                 if sg:
+                     return ['{ int64_t _n=(int64_t)(((uint64_t)R32(c->rdx)<<32)|R32(c->rax));'
+@@ -1435,7 +1770,7 @@ class Lifter:
+                     % (extra, t.imm)]
+ 
+         # ---- no-ops and flag fiddling ----
+-        if m in ('nop', 'int3', 'hint_nop', 'pause', 'wait', 'fwait', 'endbr64'):
++        if m in ('nop', 'int3', 'hint_nop', 'wait', 'fwait', 'endbr64'):
+             return ['/* %s */' % m]
+         if m == 'cld':
+             return ['/* cld */']
+@@ -1537,7 +1872,7 @@ class Lifter:
+ 
+     def lift_function(self, code, start, name=None):
+         self.jumptables = {}
+-        insns = list(self.md.disasm(code, start))
++        insns = _strip_hint_prefixes(self.md.disasm(code, start))
+         end = start + len(code)
+ 
+         # An extent that ends mid-instruction: read the few extra bytes that
+@@ -1550,7 +1885,7 @@ class Lifter:
+                     extra = self.read_va(tail, (end - tail) + 15)
+                 except Exception:
+                     extra = b''
+-                for ins in self.md.disasm(extra, tail):
++                for ins in _strip_hint_prefixes(self.md.disasm(extra, tail)):
+                     if ins.address >= end:
+                         break
+                     insns.append(ins)

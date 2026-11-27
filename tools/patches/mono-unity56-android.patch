@@ -1,0 +1,604 @@
+diff --git a/libgc/include/private/gc_locks.h b/libgc/include/private/gc_locks.h
+index ba4fd185..405e388d 100644
+--- a/libgc/include/private/gc_locks.h
++++ b/libgc/include/private/gc_locks.h
+@@ -222,7 +222,7 @@
+         }
+ #       define GC_CLEAR_DEFINED
+ #    endif /* ALPHA */
+-#    ifdef ARM32
++#    if defined(ARM32) || defined(AARCH64)
+ #       ifdef __native_client__
+ #          define MASK_REGISTER(reg, cond) "bic" cond " " reg ", " reg ", #0xc0000000\n"
+ #          define NACL_ALIGN() ".align 4\n"
+@@ -429,6 +429,21 @@
+        }
+ #     endif /* I386 */
+ 
++#     if defined(AARCH64)
++#      if !defined(GENERIC_COMPARE_AND_SWAP)
++         inline static GC_bool GC_compare_and_exchange(volatile GC_word *addr,
++                                                       GC_word old,
++                                                       GC_word new_val)
++         {
++             return (GC_bool)__sync_bool_compare_and_swap(addr, old, new_val);
++         }
++#      endif
++       inline static void GC_memory_barrier(void)
++       {
++           __sync_synchronize();
++       }
++#     endif /* AARCH64 */
++
+ #     if defined(X86_64)
+ #      if !defined(GENERIC_COMPARE_AND_SWAP)
+          /* Returns TRUE if the comparison succeeded. */
+diff --git a/libgc/include/private/gcconfig.h b/libgc/include/private/gcconfig.h
+index 3cbab919..de803726 100644
+--- a/libgc/include/private/gcconfig.h
++++ b/libgc/include/private/gcconfig.h
+@@ -258,6 +258,10 @@
+ #    define ARM32
+ #    define mach_type_known
+ # endif
++# if defined(LINUX) && defined(__aarch64__)
++#    define AARCH64
++#    define mach_type_known
++# endif
+ # if defined(LINUX) && defined(__cris__)
+ #    ifndef CRIS
+ #	define CRIS
+@@ -285,6 +289,10 @@
+ #    define ARM32
+ #    define mach_type_known
+ # endif
++# if defined(LINUX) && defined(__aarch64__)
++#    define AARCH64
++#    define mach_type_known
++# endif
+ # if defined(LINUX) && defined(__sh__)
+ #    define SH
+ #    define mach_type_known
+@@ -2072,6 +2080,31 @@
+ #   endif
+ # endif
+ 
++# ifdef AARCH64
++#   define MACH_TYPE "AARCH64"
++#   define ALIGNMENT 8
++#   define CPP_WORDSZ 64
++#   ifndef HBLKSIZE
++#     define HBLKSIZE 4096
++#   endif
++#   define CACHE_LINE_SIZE 64
++#   define USE_GENERIC_PUSH_REGS
++#   ifdef LINUX
++#     define OS_TYPE "LINUX"
++#     define LINUX_STACKBOTTOM
++#     ifndef USE_MMAP
++#       define FALLBACK_TO_MMAP
++#     endif
++#     ifdef __ELF__
++#       define DYNAMIC_LOADING
++#       include <features.h>
++#       define SEARCH_FOR_DATA_START
++        extern int _end[];
++#       define DATAEND (_end)
++#     endif
++#   endif
++# endif
++
+ # ifdef X86_64
+ #   define MACH_TYPE "X86_64"
+ #   define ALIGNMENT 8
+diff --git a/libgc/os_dep.c b/libgc/os_dep.c
+index 191e4b4e..ee8c8147 100644
+--- a/libgc/os_dep.c
++++ b/libgc/os_dep.c
+@@ -805,7 +805,7 @@ ptr_t GC_get_stack_base()
+ #   endif
+ 
+ #   if defined(SUNOS5SIGS) || defined(IRIX5) || defined(OSF1) \
+-    || defined(HURD) || defined(NETBSD) || defined(FREEBSD)
++    || defined(HURD) || defined(NETBSD) || defined(FREEBSD) || defined(LINUX)
+ 	static struct sigaction old_segv_act;
+ #	if defined(IRIX5) || defined(HPUX) \
+ 	|| defined(HURD) || defined(NETBSD)
+@@ -823,7 +823,7 @@ ptr_t GC_get_stack_base()
+ #   endif
+     {
+ #	if defined(SUNOS5SIGS) || defined(IRIX5)  \
+-        || defined(OSF1) || defined(HURD) || defined(NETBSD) || defined(FREEBSD)
++        || defined(OSF1) || defined(HURD) || defined(NETBSD) || defined(FREEBSD) || defined(LINUX)
+ 	  struct sigaction	act;
+ 
+ 	  act.sa_handler	= h;
+@@ -881,12 +881,21 @@ ptr_t GC_get_stack_base()
+     void GC_reset_fault_handler()
+     {
+ #       if defined(SUNOS5SIGS) || defined(IRIX5) \
+-	   || defined(OSF1) || defined(HURD) || defined(NETBSD) || defined(FREEBSD)
++	   || defined(OSF1) || defined(HURD) || defined(NETBSD) || defined(FREEBSD) || defined(LINUX)
+ 	  (void) sigaction(SIGSEGV, &old_segv_act, 0);
+ #	  if defined(IRIX5) \
+ 	     || defined(HPUX) || defined(HURD) || defined(NETBSD)
+ 	      (void) sigaction(SIGBUS, &old_bus_act, 0);
+ #	  endif
++	  {
++	      sigset_t unb;
++	      sigemptyset(&unb);
++	      sigaddset(&unb, SIGSEGV);
++#	      ifdef SIGBUS
++	      sigaddset(&unb, SIGBUS);
++#	      endif
++	      (void) sigprocmask(SIG_UNBLOCK, &unb, 0);
++	  }
+ #       else
+   	  (void) signal(SIGSEGV, old_segv_handler);
+ #	  ifdef SIGBUS
+diff --git a/libgc/pthread_stop_world.c b/libgc/pthread_stop_world.c
+index 3bfdfbf3..b1f3bdc0 100644
+--- a/libgc/pthread_stop_world.c
++++ b/libgc/pthread_stop_world.c
+@@ -379,11 +379,7 @@ int GC_suspend_all()
+ 	      GC_printf1("Sending suspend signal to 0x%lx\n", p -> id);
+ 	    #endif
+ 
+-#ifndef PLATFORM_ANDROID
+         result = pthread_kill(p -> id, SIG_SUSPEND);
+-#else
+-        result = android_thread_kill(p -> kernel_id, SIG_SUSPEND);
+-#endif
+ 	    switch(result) {
+                 case ESRCH:
+                     /* Not really there anymore.  Possible? */
+@@ -658,11 +654,7 @@ static void pthread_start_world()
+ 	      GC_printf1("Sending restart signal to 0x%lx\n", p -> id);
+ 	    #endif
+ 
+-#ifndef PLATFORM_ANDROID
+         result = pthread_kill(p -> id, SIG_THR_RESTART);
+-#else
+-        result = android_thread_kill(p -> kernel_id, SIG_THR_RESTART);
+-#endif
+ 	    switch(result) {
+                 case ESRCH:
+                     /* Not really there anymore.  Possible? */
+diff --git a/mcs/class/referencesource/mscorlib/system/threading/thread.cs b/mcs/class/referencesource/mscorlib/system/threading/thread.cs
+index d85cf9fb..4e06366b 100644
+--- a/mcs/class/referencesource/mscorlib/system/threading/thread.cs
++++ b/mcs/class/referencesource/mscorlib/system/threading/thread.cs
+@@ -323,10 +323,11 @@ namespace System.Threading {
+             //    StartInternal method will take care of the error reporting
+             if(m_Delegate is ThreadStart)
+             {
+-                //We expect the thread to be setup with a ParameterizedThreadStart
+-                //    if this constructor is called.
+-                //If we got here then that wasn't the case
+-                throw new InvalidOperationException(Environment.GetResourceString("InvalidOperation_ThreadWrongThreadStart"));
++                // Unity 5.6 (Mono 2.0) permitted Thread.Start(object) on ThreadStart
++                // delegates (used by AstarPath.GraphUpdateProcessor.EnableMultithreading).
++                StackCrawlMark stackMarkTs = StackCrawlMark.LookForMyCaller;
++                Start(ref stackMarkTs);
++                return;
+             }
+             m_ThreadStartArg = parameter;
+             StackCrawlMark stackMark = StackCrawlMark.LookForMyCaller;
+diff --git a/mono/io-layer/io-portability.c b/mono/io-layer/io-portability.c
+index 282cbe93..8c171488 100644
+--- a/mono/io-layer/io-portability.c
++++ b/mono/io-layer/io-portability.c
+@@ -301,15 +301,40 @@ int _wapi_chdir (const char *path)
+ 	return(ret);
+ }
+ 
++extern void w64_mono_translate_path (const char *in, char *out, size_t cap) __attribute__((weak));
++
++static gchar *w64_translate_if_win (const gchar *filename)
++{
++	if (!filename || !w64_mono_translate_path) return NULL;
++	const char *win = NULL;
++	if ((g_ascii_isalpha ((guchar)filename [0]) && filename [1] == ':') || strchr (filename, '\\') != NULL) {
++		win = filename;
++	} else {
++		const char *p = filename;
++		while ((p = strchr (p, ':')) != NULL) {
++			if (p >= filename + 2 && p [-2] == '/' && g_ascii_isalpha ((guchar)p [-1]) && (p [1] == '/' || p [1] == '\\' || p [1] == '\0')) {
++				win = p - 1;
++				break;
++			}
++			p++;
++		}
++	}
++	if (!win) return NULL;
++	char buf [1024];
++	w64_mono_translate_path (win, buf, sizeof (buf));
++	return buf [0] ? g_strdup (buf) : NULL;
++}
++
+ gchar *_wapi_basename (const gchar *filename)
+ {
+-	gchar *new_filename = g_strdup (filename), *ret;
++	gchar *translated = w64_translate_if_win (filename);
++	gchar *new_filename = translated ? translated : g_strdup (filename), *ret;
+ 
+-	if (IS_PORTABILITY_SET) {
++	if (!translated && IS_PORTABILITY_SET) {
+ 		g_strdelimit (new_filename, "\\", '/');
+ 	}
+ 
+-	if (IS_PORTABILITY_DRIVE &&
++	if (!translated && IS_PORTABILITY_DRIVE &&
+ 	    g_ascii_isalpha (new_filename[0]) &&
+ 	    (new_filename[1] == ':')) {
+ 		int len = strlen (new_filename);
+@@ -326,13 +351,14 @@ gchar *_wapi_basename (const gchar *filename)
+ 
+ gchar *_wapi_dirname (const gchar *filename)
+ {
+-	gchar *new_filename = g_strdup (filename), *ret;
++	gchar *translated = w64_translate_if_win (filename);
++	gchar *new_filename = translated ? translated : g_strdup (filename), *ret;
+ 
+-	if (IS_PORTABILITY_SET) {
++	if (!translated && IS_PORTABILITY_SET) {
+ 		g_strdelimit (new_filename, "\\", '/');
+ 	}
+ 
+-	if (IS_PORTABILITY_DRIVE &&
++	if (!translated && IS_PORTABILITY_DRIVE &&
+ 	    g_ascii_isalpha (new_filename[0]) &&
+ 	    (new_filename[1] == ':')) {
+ 		int len = strlen (new_filename);
+diff --git a/mono/io-layer/processes.c b/mono/io-layer/processes.c
+index 53c271a4..ee2142ca 100644
+--- a/mono/io-layer/processes.c
++++ b/mono/io-layer/processes.c
+@@ -10,6 +10,9 @@
+  */
+ 
+ #include <config.h>
++#ifdef __linux__
++#include <sys/sysmacros.h>
++#endif
+ #include <glib.h>
+ #include <stdio.h>
+ #include <string.h>
+diff --git a/mono/metadata/class.c b/mono/metadata/class.c
+index a1c77761..d4eab63c 100644
+--- a/mono/metadata/class.c
++++ b/mono/metadata/class.c
+@@ -1888,11 +1888,14 @@ mono_class_layout_fields (MonoClass *klass, int instance_size)
+ 	 * Value types have gc_aware_layout disabled by default, as per
+ 	 * what the default is for other runtimes.
+ 	 */
+-	 /* corlib is missing [StructLayout] directives in many places */
+-	if (layout == TYPE_ATTRIBUTE_AUTO_LAYOUT) {
+-		if (!klass->valuetype)
+-			gc_aware_layout = TRUE;
+-	}
++	/*
++	 * Unity 5.6's C++ runtime (built against Mono 2.6) hardcodes declaration-order
++	 * field offsets for classes like System.Collections.Generic.List<T> (_items at 0x10,
++	 * _size at 0x18, _version at 0x1C). Mono 4.8's ReferenceSource List<T> adds a
++	 * trailing Object _syncRoot field; gc_aware_layout would hoist _syncRoot to 0x18
++	 * before _size, breaking every Unity-deserialized List<T> and corrupting GC refs.
++	 */
++	gc_aware_layout = FALSE;
+ 
+ 	/* Compute klass->has_references */
+ 	/* 
+diff --git a/mono/metadata/icall.c b/mono/metadata/icall.c
+index 46644db1..0324662f 100644
+--- a/mono/metadata/icall.c
++++ b/mono/metadata/icall.c
+@@ -8575,12 +8575,13 @@ mono_lookup_internal_call_full (MonoMethod *method, mono_bool *uses_handles)
+ 	
+ 	mono_icall_lock ();
+ 
++	extern gpointer w64_mono_wrap_icall (MonoMethod *method, gpointer addr) __attribute__((weak));
+ 	res = g_hash_table_lookup (icall_hash, mname);
+ 	if (res) {
+ 		if (uses_handles)
+ 			*uses_handles = FALSE;
+-		mono_icall_unlock ();;
+-		return res;
++		mono_icall_unlock ();
++		return w64_mono_wrap_icall ? w64_mono_wrap_icall (method, res) : res;
+ 	}
+ 	/* try without signature */
+ 	*sigstart = 0;
+@@ -8589,7 +8590,7 @@ mono_lookup_internal_call_full (MonoMethod *method, mono_bool *uses_handles)
+ 		if (uses_handles)
+ 			*uses_handles = FALSE;
+ 		mono_icall_unlock ();
+-		return res;
++		return w64_mono_wrap_icall ? w64_mono_wrap_icall (method, res) : res;
+ 	}
+ 
+ #ifdef DISABLE_ICALL_TABLES
+diff --git a/mono/metadata/loader.c b/mono/metadata/loader.c
+index 198229fa..da6a7d8d 100644
+--- a/mono/metadata/loader.c
++++ b/mono/metadata/loader.c
+@@ -1201,6 +1201,17 @@ mono_lookup_pinvoke_call (MonoMethod *method, const char **exc_class, const char
+ 
+ 	mono_dllmap_lookup (image, orig_scope, import, &new_scope, &import);
+ 
++	{
++		extern gpointer w64_mono_resolve_pinvoke (MonoMethod *method, const char *dll, const char *sym, guint32 piflags) __attribute__((weak));
++		if (w64_mono_resolve_pinvoke) {
++			gpointer w64_fn = w64_mono_resolve_pinvoke (method, orig_scope, import, piinfo->piflags);
++			if (w64_fn) {
++				piinfo->addr = w64_fn;
++				return piinfo->addr;
++			}
++		}
++	}
++
+ 	if (!module) {
+ 		mono_image_lock (image);
+ 		if (!image->pinvoke_scopes) {
+diff --git a/mono/metadata/unity-liveness.c b/mono/metadata/unity-liveness.c
+index 7f8048c2..e29b4f12 100644
+--- a/mono/metadata/unity-liveness.c
++++ b/mono/metadata/unity-liveness.c
+@@ -160,15 +160,9 @@ static void mono_traverse_objects (LivenessState* state);
+ 
+ static void mono_traverse_generic_object( MonoObject* object, LivenessState* state ) 
+ {
+-#ifdef HAVE_SGEN_GC
+-	gsize gc_desc = 0;
+-#else
+-	gsize gc_desc = (gsize)(GET_VTABLE(object)->gc_descr);
+-#endif
+-
+-	if (gc_desc & (gsize)1)
+-		mono_traverse_gc_desc (object, state);
+-	else if (GET_VTABLE(object)->klass->rank)
++	/* Always use exact managed type traversal (never Boehm conservative gc_descr bitmap,
++	 * which sets bits for IntPtr/native handles and crashes on small integer values). */
++	if (GET_VTABLE(object)->klass->rank)
+ 		mono_traverse_array ((MonoArray*)object, state);
+ 	else
+ 		mono_traverse_object (object, state);
+@@ -177,6 +171,8 @@ static void mono_traverse_generic_object( MonoObject* object, LivenessState* sta
+ 
+ static void mono_add_process_object (MonoObject* object, LivenessState* state)
+ {
++	if ((uintptr_t)object < 0x10000)
++		return;
+ 	if (object && !IS_MARKED(object))
+ 	{
+ 		gboolean has_references = GET_VTABLE(object)->klass->has_references;
+diff --git a/mono/mini/method-to-ir.c b/mono/mini/method-to-ir.c
+index 989d1cee..791c01c2 100644
+--- a/mono/mini/method-to-ir.c
++++ b/mono/mini/method-to-ir.c
+@@ -1067,6 +1067,7 @@ type_from_op (MonoCompile *cfg, MonoInst *ins, MonoInst *src1, MonoInst *src2)
+ 			break;
+ 		case STACK_PTR:
+ 		case STACK_MP:
++		case STACK_OBJ:
+ #if SIZEOF_VOID_P == 8
+ 			ins->opcode = OP_LCONV_TO_U;
+ #else
+diff --git a/mono/mini/mini-exceptions.c b/mono/mini/mini-exceptions.c
+index ec1466db..4a1f9010 100644
+--- a/mono/mini/mini-exceptions.c
++++ b/mono/mini/mini-exceptions.c
+@@ -2307,6 +2307,10 @@ mono_handle_hard_stack_ovf (MonoJitTlsData *jit_tls, MonoJitInfo *ji, void *ctx,
+ 	_exit (1);
+ }
+ 
++#if defined (PLATFORM_ANDROID)
++#include <android/log.h>
++#endif
++
+ static gboolean
+ print_stack_frame_to_stderr (StackFrameInfo *frame, MonoContext *ctx, gpointer data)
+ {
+@@ -2318,9 +2322,16 @@ print_stack_frame_to_stderr (StackFrameInfo *frame, MonoContext *ctx, gpointer d
+ 	if (method) {
+ 		gchar *location = mono_debug_print_stack_frame (method, frame->native_offset, mono_domain_get ());
+ 		mono_runtime_printf_err ("  %s", location);
++#if defined (PLATFORM_ANDROID)
++		__android_log_print (ANDROID_LOG_ERROR, "theforest-mono", "  %s", location);
++#endif
+ 		g_free (location);
+-	} else
++	} else {
+ 		mono_runtime_printf_err ("  at <unknown> <0x%05x>", frame->native_offset);
++#if defined (PLATFORM_ANDROID)
++		__android_log_print (ANDROID_LOG_ERROR, "theforest-mono", "  at <unknown> <0x%05x>", frame->native_offset);
++#endif
++	}
+ 
+ 	return FALSE;
+ }
+@@ -2409,6 +2420,11 @@ mono_handle_native_sigsegv (int signal, void *ctx, MONO_SIG_HANDLER_INFO_TYPE *i
+ 	/* To prevent infinite loops when the stack walk causes a crash */
+ 	handling_sigsegv = TRUE;
+ 
++#if defined (PLATFORM_ANDROID)
++	__android_log_print (ANDROID_LOG_ERROR, "theforest-mono", "=== NATIVE %s (sig=%d addr=%p) ===",
++		signal_str, signal, info ? info->si_addr : NULL);
++#endif
++
+ 	/* !jit_tls means the thread was not registered with the runtime */
+ 	if (jit_tls && mono_thread_internal_current ()) {
+ 		mono_runtime_printf_err ("Stacktrace:\n");
+@@ -2509,9 +2525,15 @@ mono_handle_native_sigsegv (int signal, void *ctx, MONO_SIG_HANDLER_INFO_TYPE *i
+ #endif
+ 
+ 	if (!mono_do_crash_chaining) {
+-		/*Android abort is a fluke, it doesn't abort, it triggers another segv. */
++		/* Restore SIG_DFL on Android so debuggerd captures the exact faulting PC/backtrace */
+ #if defined (PLATFORM_ANDROID)
+-		exit (-1);
++#ifdef MONO_ARCH_USE_SIGACTION
++		sa.sa_handler = SIG_DFL;
++		sigemptyset (&sa.sa_mask);
++		sa.sa_flags = 0;
++		sigaction (signal, &sa, NULL);
++#endif
++		return;
+ #else
+ 		abort ();
+ #endif
+diff --git a/mono/mini/mini-posix.c b/mono/mini/mini-posix.c
+index bdd3149c..c67f7083 100644
+--- a/mono/mini/mini-posix.c
++++ b/mono/mini/mini-posix.c
+@@ -469,7 +469,7 @@ mono_runtime_posix_install_handlers (void)
+ 	add_signal_handler (SIGFPE, mono_sigfpe_signal_handler, 0);
+ 	add_signal_handler (SIGQUIT, sigquit_signal_handler, SA_RESTART);
+ 	add_signal_handler (SIGILL, mono_sigill_signal_handler, 0);
+-	add_signal_handler (SIGBUS, mono_sigsegv_signal_handler, 0);
++	add_signal_handler (SIGBUS, mono_sigsegv_signal_handler, SA_ONSTACK);
+ 	if (mono_jit_trace_calls != NULL)
+ 		add_signal_handler (SIGUSR2, sigusr2_signal_handler, SA_RESTART);
+ 
+@@ -483,6 +483,8 @@ mono_runtime_posix_install_handlers (void)
+ 	if (mono_gc_get_restart_signal () != -1)
+ 		sigaddset (&signal_set, mono_gc_get_restart_signal ());
+ 	sigaddset (&signal_set, SIGCHLD);
++	sigaddset (&signal_set, SIGSEGV);
++	sigaddset (&signal_set, SIGBUS);
+ 	sigprocmask (SIG_UNBLOCK, &signal_set, NULL);
+ 
+ 	signal (SIGPIPE, SIG_IGN);
+@@ -490,7 +492,7 @@ mono_runtime_posix_install_handlers (void)
+ 	add_signal_handler (SIGABRT, sigabrt_signal_handler, 0);
+ 
+ 	/* catch SIGSEGV */
+-	add_signal_handler (SIGSEGV, mono_sigsegv_signal_handler, 0);
++	add_signal_handler (SIGSEGV, mono_sigsegv_signal_handler, SA_ONSTACK);
+ }
+ 
+ #ifndef PLATFORM_MACOSX
+diff --git a/mono/mini/mini-runtime.c b/mono/mini/mini-runtime.c
+index 8222f550..28bc69f3 100644
+--- a/mono/mini/mini-runtime.c
++++ b/mono/mini/mini-runtime.c
+@@ -2840,6 +2840,18 @@ MONO_SIG_HANDLER_FUNC (, mono_sigsegv_signal_handler)
+ 
+ 	/* The thread might no be registered with the runtime */
+ 	if (!mono_domain_get () || !jit_tls) {
++#if defined(__ANDROID__) && defined(__aarch64__)
++		{
++			extern void w64_mono_log_crash (uint64_t pc, uint64_t lr, uint64_t sp, uint64_t fault) __attribute__((weak));
++			ucontext_t *uc = (ucontext_t *)ctx;
++			if (w64_mono_log_crash && uc) {
++				w64_mono_log_crash ((uint64_t)uc->uc_mcontext.pc,
++					(uint64_t)uc->uc_mcontext.regs[30],
++					(uint64_t)uc->uc_mcontext.sp,
++					(uint64_t)(uintptr_t)fault_addr);
++			}
++		}
++#endif
+ 		if (!mono_do_crash_chaining && mono_chain_signal (MONO_SIG_HANDLER_PARAMS))
+ 			return;
+ 		mono_handle_native_sigsegv (SIGSEGV, ctx, info);
+@@ -2886,6 +2898,18 @@ MONO_SIG_HANDLER_FUNC (, mono_sigsegv_signal_handler)
+ #else
+ 
+ 	if (!ji) {
++#if defined(__ANDROID__) && defined(__aarch64__)
++		{
++			extern void w64_mono_log_crash (uint64_t pc, uint64_t lr, uint64_t sp, uint64_t fault) __attribute__((weak));
++			ucontext_t *uc = (ucontext_t *)ctx;
++			if (w64_mono_log_crash && uc) {
++				w64_mono_log_crash ((uint64_t)uc->uc_mcontext.pc,
++					(uint64_t)uc->uc_mcontext.regs[30],
++					(uint64_t)uc->uc_mcontext.sp,
++					(uint64_t)(uintptr_t)fault_addr);
++			}
++		}
++#endif
+ 		if (!mono_do_crash_chaining && mono_chain_signal (MONO_SIG_HANDLER_PARAMS))
+ 			return;
+ 
+@@ -3625,6 +3649,10 @@ mini_init (const char *filename, const char *runtime_version)
+ 		mono_llvm_init ();
+ #endif
+ 
++#if defined(__ANDROID__)
++	/* Emit explicit null checks in ARM64 JIT instead of relying on SIGSEGV delivery through ART libsigchain. */
++	debug_options.explicit_null_checks = TRUE;
++#endif
+ 	mono_trampolines_init ();
+ 
+ 	mono_native_tls_alloc (&mono_jit_tls_id, NULL);
+diff --git a/mono/utils/mono-io-portability.c b/mono/utils/mono-io-portability.c
+index 54c6320d..f215338b 100644
+--- a/mono/utils/mono-io-portability.c
++++ b/mono/utils/mono-io-portability.c
+@@ -14,6 +14,8 @@
+ 
+ int mono_io_portability_helpers = PORTABILITY_UNKNOWN;
+ 
++extern void w64_mono_translate_path (const char *in, char *out, size_t cap) __attribute__((weak));
++
+ static inline gchar *mono_portability_find_file_internal (GString **report, const gchar *pathname, gboolean last_exists);
+ 
+ void mono_portability_helpers_init (void)
+@@ -23,7 +25,7 @@ void mono_portability_helpers_init (void)
+ 	if (mono_io_portability_helpers != PORTABILITY_UNKNOWN)
+ 		return;
+ 	
+-        mono_io_portability_helpers = PORTABILITY_NONE;
++        mono_io_portability_helpers = w64_mono_translate_path ? (PORTABILITY_DRIVE | PORTABILITY_CASE) : PORTABILITY_NONE;
+ 	
+         env = g_getenv ("MONO_IOMAP");
+         if (env != NULL) {
+@@ -126,6 +128,28 @@ gchar *mono_portability_find_file (const gchar *pathname, gboolean last_exists)
+ 	
+ 	if (!pathname || !pathname [0])
+ 		return NULL;
++	if (w64_mono_translate_path) {
++		const char *win = NULL;
++		if ((g_ascii_isalpha ((guchar)pathname [0]) && pathname [1] == ':') || strchr (pathname, '\\') != NULL) {
++			win = pathname;
++		} else {
++			/* POSIX Path.GetFullPath("C:/...") prepends cwd -> "/.../C:/..." */
++			const char *p = pathname;
++			while ((p = strchr (p, ':')) != NULL) {
++				if (p >= pathname + 2 && p [-2] == '/' && g_ascii_isalpha ((guchar)p [-1]) && (p [1] == '/' || p [1] == '\\' || p [1] == '\0')) {
++					win = p - 1;
++					break;
++				}
++				p++;
++			}
++		}
++		if (win) {
++			char translated [1024];
++			w64_mono_translate_path (win, translated, sizeof (translated));
++			if (translated [0])
++				return g_strdup (translated);
++		}
++	}
+ 	ret = mono_portability_find_file_internal (&report, pathname, last_exists);
+ 
+ 	if (report)
+diff --git a/support/libm/complex.c b/support/libm/complex.c
+index 18a4f9bb..b155460d 100644
+--- a/support/libm/complex.c
++++ b/support/libm/complex.c
+@@ -10,6 +10,10 @@
+  * ====================================================
+  */
+ 
++#if defined(__ANDROID__) && __ANDROID_API__ >= 23
++/* Android API 23+ Bionic libm provides C99 complex functions natively. */
++typedef int mono_libm_complex_dummy_t;
++#else
+ #include <sys/cdefs.h>
+ 
+ #include <float.h>
+@@ -72,3 +76,5 @@ cabs(double complex z)
+ {
+ 	return hypot(creal(z), cimag(z));
+ }
++
++#endif

@@ -1,0 +1,19 @@
+# Lifted units compiled at -O0 on arm64 (all other 603 units compile at -O2 -march=armv8.2-a):
+#   0017..0024: Unity Camera / Collider / NGUI UIButton click dispatch stability under -O2
+#   0038..0045: Unity TimeManager / Generic Mono / StreamedBinaryRead deserialization under -O2
+TheForest/recomp_funcs_0017
+TheForest/recomp_funcs_0018
+TheForest/recomp_funcs_0019
+TheForest/recomp_funcs_0020
+TheForest/recomp_funcs_0021
+TheForest/recomp_funcs_0022
+TheForest/recomp_funcs_0023
+TheForest/recomp_funcs_0024
+TheForest/recomp_funcs_0038
+TheForest/recomp_funcs_0039
+TheForest/recomp_funcs_0040
+TheForest/recomp_funcs_0041
+TheForest/recomp_funcs_0042
+TheForest/recomp_funcs_0043
+TheForest/recomp_funcs_0044
+TheForest/recomp_funcs_0045

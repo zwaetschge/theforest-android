@@ -1,0 +1,44 @@
+# Game-derived or bulky outputs: never commit
+ref/
+gen/
+gen.new/
+gen.old/
+build/
+work/
+out/
+*.exe
+*.dll
+*.gpak
+*.so
+*.apk
+*.o
+*.oxx
+*.a
+*.jks
+*.keystore
+
+# Third-party sources are fetched by tools/fetch_deps.sh, never vendored
+third_party/dl/
+third_party/SDL3-*/
+third_party/dxvk-native/
+third_party/pcrecomp/
+third_party/mono/
+third_party/glslang-*/
+third_party/SPIRV-Cross-*/
+third_party/miniz/
+third_party/stb/
+third_party/libvpx-*/
+
+# Android build outputs & extracted Mono BCL assets
+android/.gradle/
+android/app/build/
+android/build/
+android/local.properties
+android/app/src/main/jniLibs/
+android/app/src/main/assets/mono_bcl/
+
+# Local env & runtime logs
+tools/local.env
+*_d3d11.log
+*_dxgi.log
+*.dxvk-cache
