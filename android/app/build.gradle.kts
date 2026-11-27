@@ -9,8 +9,8 @@ android {
         applicationId = "ch.plum.theforest"
         minSdk = 29
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.2.0"
+        versionCode = 3
+        versionName = "0.2.1"
         ndk { abiFilters += "arm64-v8a" }
     }
     // libmain.so (runtime + lifted game code + Mono + DXVK) and libSDL3.so are prebuilt with the NDK

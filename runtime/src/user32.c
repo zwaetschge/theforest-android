@@ -687,6 +687,7 @@ static void GetKeyboardState_(CPU *c) { memcpy(AP(0), g_keys, 256); RET(1); }
 #define RI_N 1024
 #define HDEV_MOUSE 0x52490001ull
 #define HDEV_KBD   0x52490002ull
+#define HDEV_PAD   0x52490003ull
 typedef struct { uint32_t type; uint8_t data[24]; uint32_t seq; } rawrec_t;
 static rawrec_t g_ri[RI_N];
 static uint32_t g_ri_seq, g_ri_read;          /* next sequence number; first one not yet drained */
@@ -798,22 +799,30 @@ static void GetRawInputBuffer_(CPU *c)
     if (n) q_drop_wm_input_upto(upto);
     RET(n);
 }
-/* GetRawInputDeviceList(RAWINPUTDEVICELIST[] {HANDLE, u32 type}, *n, size) */
+/* GetRawInputDeviceList(RAWINPUTDEVICELIST[] {HANDLE, u32 type}, *n, size)
+ * Expose an XInput HID gamepad ("IG_00", VID_045E&PID_028E, UsagePage=1 Usage=5) alongside mouse
+ * and keyboard: Unity 5.6's RawInput::Initialize() scans GetRawInputDeviceList for "IG_" HID
+ * gamepads before it will poll XInputGetState() for UnityEngine.Input (KeyCode.JoystickButton0/1
+ * used by NGUI UICamera menus). Rewired also recognizes "IG_" as XInput and routes it via XInput. */
 static void GetRawInputDeviceList_(CPU *c)
 {
-    if (!A(0)) { wr32(A(1), 2); RET(0); }
-    if (rd32(A(1)) < 2) { wr32(A(1), 2); w64_set_last_error(122); RET(0xFFFFFFFFu); }
-    wr64(A(0), HDEV_MOUSE); wr32(A(0) + 8, 0); wr64(A(0) + 16, HDEV_KBD); wr32(A(0) + 24, 1);
-    RET(2);
+    if (!A(0)) { wr32(A(1), 3); RET(0); }
+    if (rd32(A(1)) < 3) { wr32(A(1), 3); w64_set_last_error(122); RET(0xFFFFFFFFu); }
+    wr64(A(0), HDEV_MOUSE); wr32(A(0) + 8, 0);
+    wr64(A(0) + 16, HDEV_KBD); wr32(A(0) + 24, 1);
+    wr64(A(0) + 32, HDEV_PAD); wr32(A(0) + 40, 2 /* RIM_TYPEHID */);
+    RET(3);
 }
 /* GetRawInputDeviceInfoW(h, command, data, *size): RIDI_DEVICENAME / RIDI_DEVICEINFO */
 static void GetRawInputDeviceInfoW_(CPU *c)
 {
     uint64_t h = A(0);
     uint32_t cmd = AU(1);
-    if (h != HDEV_MOUSE && h != HDEV_KBD) RET(0xFFFFFFFFu);
+    if (h != HDEV_MOUSE && h != HDEV_KBD && h != HDEV_PAD) RET(0xFFFFFFFFu);
     if (cmd == 0x20000007) {                                       /* RIDI_DEVICENAME (chars) */
-        const char *n = h == HDEV_MOUSE ? "\\\\?\\HID#VID_0000&PID_0001#mouse" : "\\\\?\\HID#VID_0000&PID_0002#keyboard";
+        const char *n = h == HDEV_MOUSE ? "\\\\?\\HID#VID_0000&PID_0001#mouse"
+                      : h == HDEV_KBD   ? "\\\\?\\HID#VID_0000&PID_0002#keyboard"
+                                        : "\\\\?\\HID#VID_045E&PID_028E&IG_00#7&12345678&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}";
         uint32_t need = (uint32_t)strlen(n) + 1;
         if (!A(2) || rd32(A(3)) < need) { wr32(A(3), need); RET(A(2) ? 0xFFFFFFFFu : 0); }
         utf8_to_w16(n, (uint16_t *)AP(2), (int)need);
@@ -825,7 +834,8 @@ static void GetRawInputDeviceInfoW_(CPU *c)
         memset(d + 4, 0, 28);
         wr32(A(2), 32);
         if (h == HDEV_MOUSE) { wr32(A(2) + 4, 0); wr32(A(2) + 8, 1); wr32(A(2) + 12, 3); wr32(A(2) + 16, 100); }
-        else { wr32(A(2) + 4, 1); wr32(A(2) + 8, 4); wr32(A(2) + 12, 0); wr32(A(2) + 16, 1); wr32(A(2) + 20, 12); wr32(A(2) + 24, 104); }
+        else if (h == HDEV_KBD) { wr32(A(2) + 4, 1); wr32(A(2) + 8, 4); wr32(A(2) + 12, 0); wr32(A(2) + 16, 1); wr32(A(2) + 20, 12); wr32(A(2) + 24, 104); }
+        else { wr32(A(2) + 4, 2 /* RIM_TYPEHID */); wr32(A(2) + 8, 0x045E); wr32(A(2) + 12, 0x028E); wr32(A(2) + 16, 0x0114); wr16(A(2) + 20, 1); wr16(A(2) + 22, 5); }
         RET(32);
     }
     RET(0xFFFFFFFFu);
@@ -924,21 +934,45 @@ void w64_user32_hold_frames(int n)
     unsigned long f0 = hp_present_count();
     for (int i = 0; i < 100; i++) {
         usleep(10000);
-        if (i >= 8 && hp_present_count() >= f0 + (unsigned long)n) break;
+        if (i >= 2 && hp_present_count() >= f0 + (unsigned long)n) break;
     }
 }
 /* W64_INPUT="sec:click:x:y;sec:key:vk;sec:move:dx:dy;sec:text:abc" - seconds since the first window */
 void w64_user32_click(int x, int y)
 {
+    static int click_log_cnt;
+    uint64_t lp = (uint64_t)(uint16_t)x | ((uint64_t)(uint16_t)y << 16);
+    unsigned long f0 = hp_present_count();
+    /* Nudge by 1px if at same pos so NGUI UICamera.ProcessMouse() exits Controller scheme (sqrMagnitude >= 0.001) */
+    if (g_mx == x && g_my == y) {
+        int nx = x > 0 ? x - 1 : x + 1;
+        uint64_t nlp = (uint64_t)(uint16_t)nx | ((uint64_t)(uint16_t)y << 16);
+        w64_user32_mouse_pos(nx, y);
+        w64_user32_raw_mouse(nx - x, 0, 0, 0);
+        w64_user32_post_input(0x0200, 0, nlp);
+        w64_user32_hold_frames(1);
+    }
     w64_user32_mouse_pos(x, y);
-    w64_user32_post_input(0x0200, 0, (uint64_t)(uint16_t)x | ((uint64_t)(uint16_t)y << 16));
+    w64_user32_raw_mouse(1, 0, 0, 0);
+    w64_user32_post_input(0x0200, 0, lp);
+    w64_user32_hold_frames(1);
     w64_user32_key_state(1, 1);
     w64_user32_raw_mouse(0, 0, 0x0001, 0);
-    w64_user32_post_input(0x0201, 1, (uint64_t)(uint16_t)x | ((uint64_t)(uint16_t)y << 16));
+    w64_user32_post_input(0x0201, 1, lp);
     w64_user32_hold_frames(2);
+    unsigned long f1 = hp_present_count();
     w64_user32_key_state(1, 0);
     w64_user32_raw_mouse(0, 0, 0x0002, 0);
-    w64_user32_post_input(0x0202, 0, (uint64_t)(uint16_t)x | ((uint64_t)(uint16_t)y << 16));
+    w64_user32_post_input(0x0202, 0, lp);
+    if (click_log_cnt < 12) {
+        click_log_cnt++;
+        w64_log("[user32] click (%d,%d) f=%lu->%lu focus=%#llx", x, y, f0, f1, (unsigned long long)g_focus);
+    }
+}
+void w64_user32_get_mouse_pos(int *x, int *y)
+{
+    if (x) *x = g_mx;
+    if (y) *y = g_my;
 }
 void w64_user32_key(int vk, int down)
 {

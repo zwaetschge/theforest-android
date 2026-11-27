@@ -20,7 +20,7 @@ Ein nativer Android-Port (`arm64-v8a`) der PC-Version von **The Forest** (Unity 
 
 ## Status
 
-Spielbarer Singleplayer (`0.2.0`). Auf echter Android-Hardware verifiziert (**AYN Odin 3** und **Samsung Galaxy Tab S8 Ultra**): Boot, 3D-Höhlen-Titelbildschirm, NGUI-Menüs, Neues Spiel, `ForestMain_v08`-Open-World-Laden (`0` Mono-/Astar-/ItemDatabase-Exceptions), Flugzeugabsturz-Intro & Skip, 3D-Wald-Erkundung im Freien, FMOD-Studio-Audio (WASAPI → SDL3), physischer Controller + On-Screen-`PadView`, automatisches Entpacken von ZIP64-Datenpaketen, automatisches Mobil-Grafik-Preset beim Erststart (`FullRes`-Texturen + `FXAA`) sowie Background/Resume-Lifecycle (gleiche PID, persistenter Adreno-`VkPipelineCache`). Technisches Protokoll: [`port/RECOMP_STATUS.md`](port/RECOMP_STATUS.md).
+Spielbarer Singleplayer (`0.2.1`). Auf echter Android-Hardware verifiziert (**AYN Odin 3** und **Samsung Galaxy Tab S8 Ultra**): Boot, 3D-Höhlen-Titelbildschirm, vollständige NGUI-Menüsteuerung per Controller (`A`/`B`/`Y`/`Start`, Sticks, Steuerkreuz), Neues Spiel, `ForestMain_v08`-Open-World-Laden (`0` Mono-/Astar-/ItemDatabase-Exceptions), Flugzeugabsturz-Intro & Skip, 3D-Wald-Erkundung im Freien, FMOD-Studio-Audio (WASAPI → SDL3), direkter Android-Controller-Treiber + automatisch ausgeblendetes On-Screen-`PadView`, automatisches Entpacken von ZIP64-Datenpaketen, automatisches Mobil-Grafik-Preset beim Erststart (`FullRes`-Texturen + `FXAA`) sowie Background/Resume-Lifecycle (gleiche PID, persistenter Adreno-`VkPipelineCache`). Technisches Protokoll: [`port/RECOMP_STATUS.md`](port/RECOMP_STATUS.md).
 
 | Gerät | GPU | Auflösung | Titelbildschirm | 3D-Wald (Open World, `0.2.0`) | RAM (PSS) |
 |---|---|---|---|---|---|
@@ -48,7 +48,7 @@ cd theforest-android
 ./build.sh "/pfad/zu/The Forest"
 ```
 
-Ergebnis: `out/TheForest-Android-0.2.0.apk` (ca. 64 MB).
+Ergebnis: `out/TheForest-Android-0.2.1.apk` (ca. 64 MB).
 
 Was `./build.sh` ausführt (in Docker über `docker/Dockerfile` und `tools/build.sh`):
 
@@ -58,13 +58,13 @@ Was `./build.sh` ausführt (in Docker über `docker/Dockerfile` und `tools/build
 4. Bereitet DXVK Native D3D11 für Android vor (`gfx/dxvk/prepare.py`) und kompiliert die internen Vulkan-1.1-Shader (`gfx/dxvk/shaders.py`).
 5. Kreuzkompiliert Unity Mono 4.8 (Boehm GC) für `arm64-v8a` (`tools/build_mono_android.sh`) und baut die 13 Open-Source-Mono-4.8-BCL-DLLs (`tools/build_mono_bcl.sh`) in `assets/mono_bcl/`.
 6. Kompiliert `libmain.so` (**614,5/619 Units = 99,3 %** mit `-O2 -march=armv8.2-a`, nur noch 4,5 Units mit `-O0` laut `config/o0_host.txt` + `0018`-Tail-Pragma) + `libSDL3.so` für `arm64-v8a` mit Android NDK `27.3.13750724`.
-7. Baut und signiert `out/TheForest-Android-0.2.0.apk` per Gradle (erzeugt automatisch einen wiederverwendbaren Keystore in `work/release.keystore` oder nutzt `TF_KEYSTORE*`).
+7. Baut und signiert `out/TheForest-Android-0.2.1.apk` per Gradle (erzeugt automatisch einen wiederverwendbaren Keystore in `work/release.keystore` oder nutzt `TF_KEYSTORE*`).
 
 Wenig RAM? Mit `JOBS=4 ./build.sh ...` begrenzt du die parallelen Compiler-Jobs. Auf Linux ohne Docker genügen die Pakete aus `docker/Dockerfile` und direkt `sh tools/build.sh "/pfad/zu/The Forest"`.
 
 ## Installieren & Spielen
 
-1. APK installieren: `adb install -r out/TheForest-Android-0.2.0.apk`
+1. APK installieren: `adb install -r out/TheForest-Android-0.2.1.apk`
 2. Eigene PC-Spieldaten importieren (ca. 1,99 GB: `TheForest.exe` und `TheForest_Data/`):
    - App starten und über **„Ordner wählen“** den Spielordner auswählen, **oder**
    - den Spielordner als ZIP/ZIP64 packen und über **„Datenpaket (ZIP) wählen“** entpacken (oder in `Android/obb/ch.plum.theforest/` ablegen, dann wird er beim nächsten Öffnen automatisch entpackt), **oder**
@@ -73,8 +73,8 @@ Wenig RAM? Mit `JOBS=4 ./build.sh ...` begrenzt du die parallelen Compiler-Jobs.
 
 ### Steuerung & Optionen
 
-- **Physischer Controller** (Handheld-Steuerung, Bluetooth, USB): direkt als XInput-Controller 0 gebunden.
-- **On-Screen-Pad (`PadView`)**: linker Stick, `A`/`B`/`X`/`Y`, `LB`/`RB`/`LT`/`RT`, `LS`/`RS`, `Back`/`Start`, Wischen rechts dreht die Kamera, kurzes Tippen klickt im Menü, **`Pad ✕`** oben rechts blendet das Pad aus/ein.
+- **Physischer Controller** (Handheld-Steuerung, Bluetooth, USB): direkter Android-Hardware-Gamepad-Treiber auf XInput-Slot 0 + virtuelles XInput-HID-Gerät für Unity-5.6-NGUI-Menüs (`A`/`B`/`Y`/`Start`, Sticks, D-Pad, Trigger); blendet das On-Screen-Pad bei erkanntem Controller automatisch aus.
+- **On-Screen-Pad (`PadView`)**: linker Stick, `A`/`B`/`X`/`Y`, `LB`/`RB`/`LT`/`RT`, `LS`/`RS`, `Back`/`Start`, Wischen rechts dreht die Kamera, kurzes Tippen klickt im Menü, **`Pad` / `Pad ✕`** oben rechts blendet das Pad aus/ein.
 - **Auflösung**: standardmäßig 1280 px Breite (`1280×720`, hardware-skaliert durch Android) für maximale Performance; im Launcher optional **„Volle Bildschirmauflösung“** aktivierbar.
 - **Grafik-Preset**: beim Erststart (oder einmalig beim Update von `0.1.0`) wird automatisch ein scharfes Mobil-Grafik-Preset (`FullRes`-Texturen + `FXAA` + mobil optimierte Schatten/Physik) für 30–60 fps angewendet; alle Optionen bleiben im Spiel unter `OPTIONS → GRAPHICS` frei anpassbar, und der Launcher bietet zusätzlich einen 1-Tap-Button.
 - **Spielstände, Einstellungen & Caches**: liegen unter `Android/data/ch.plum.theforest/files/user/` (`registry.dat`, `C/Users/Player/...`, `vk_pipeline.cache`, `app_process64.dxvk-cache`, `runtime.log`).

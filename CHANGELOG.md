@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.1 – Physical Controller & NGUI Menu Fix
+
+- **Direct Android Hardware Controller Driver (`ForestActivity.java`, `android_main.c`):**
+  - Captures physical gamepads (`dispatchKeyEvent` + `dispatchGenericMotionEvent`) directly for `KEYCODE_BUTTON_*`, `KEYCODE_DPAD_*`, `AXIS_X/Y/Z/RZ/RX/RY`, `AXIS_LTRIGGER`/`AXIS_BRAKE`, `AXIS_RTRIGGER`/`AXIS_GAS`, and `AXIS_HAT_X/Y` with smooth `0.12` deadzone into XInput slot 0, bypassing SDL3's strict `SOURCE_JOYSTICK` filter and duplicated trigger axis mapping (e.g., AYN Odin 3 built-in `Xbox Wireless Controller`).
+  - Disables duplicate SDL3 gamepad events once the Java hardware pad driver is active.
+- **Full Controller Menu Navigation (`user32.c`, `k32_file.c`, `tf_compat.c`, `xinput.c`):**
+  - Exposes our virtual XInput gamepad (`VID_045E&PID_028E&IG_00`) through RawInput (`GetRawInputDeviceList` / `GetRawInputDeviceInfoW`) and implements Unity 5.6's HID button pipeline (`CreateFileW`, `ReadFile` → `ERROR_IO_PENDING`, `GetOverlappedResult` → `ERROR_IO_INCOMPLETE`/report, `HidD_GetPreparsedData`, `HidD_GetProductString`, `HidP_GetCaps`, `HidP_GetButtonCaps`, `HidP_GetData`, `HidP_MaxDataListLength`).
+  - Fixes `UnityEngine.Input.GetKeyDown(KeyCode.JoystickButton0..9)` used by NGUI `UICamera` so `A` (Submit), `B` (Back), `Y` (Skip Intro), and `Start` (Pause / Resume) work natively across all menus without touch taps.
+- **Auto-Hiding On-Screen Pad & Menu Touch Polish (`PadView.java`, `android_main.c`, `user32.c`):**
+  - Automatically hides the on-screen `PadView` when a physical controller is detected at startup or used (still toggleable via the top-right `Pad` button).
+  - Adds an optional Right-Stick virtual cursor ring in menus (auto-hides on Left-Stick / D-Pad input) and a 1-frame hover settle + 1 px nudge so switching from controller back to touch clicks reliably on the first tap.
+- **Verified (`Samsung Galaxy Tab S8 Ultra`, `0.2.1`):**
+  - 100% controller-only flow verified end-to-end: Title Screen → `SINGLE PLAYER (A)` → `NEW GAME (A)` → `B` (`BACK`) → `SINGLE PLAYER (A)` → `NEW GAME (A)` → `NORMAL (A)` → `ForestMain_v08` load → `Y` crash-intro skip → `Start` Pause menu → `CONTINUE (A)` resume; FMOD audio `0 of 1000 blocks short`.
+
 ## 0.2.0 – 3.3×–3.6× Open-World Performance Overhaul & Crisp Mobile Preset
 
 - **99.3% `-O2` Coverage (`614.5 / 619` units, APK `79.8 MB → 64 MB`):**

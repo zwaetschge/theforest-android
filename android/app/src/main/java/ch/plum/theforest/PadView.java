@@ -32,19 +32,36 @@ public class PadView extends View {
         new Btn("LS", LS, true), new Btn("RS", RS, true),
     };
     private final RectF toggle = new RectF();
-    private boolean shown = true, autoHidden = false;
-    private float lookX, lookY;
+    private boolean shown = !ForestActivity.hasHwPad(), autoHidden = false, hwHiddenApplied = ForestActivity.hasHwPad();
+    private float lookX, lookY, vcx = -1f, vcy = -1f;
     static final float LOOK_GAIN = 1.0f;
     private final Runnable cursorPoll = new Runnable() {
         @Override public void run() {
             boolean hide;
-            try { hide = ForestActivity.nativeCursorShown(); } catch (UnsatisfiedLinkError e) { hide = false; }
+            float nx = -1f, ny = -1f;
+            try {
+                hide = ForestActivity.nativeCursorShown();
+                if (hide) {
+                    nx = ForestActivity.nativeVCursorX();
+                    ny = ForestActivity.nativeVCursorY();
+                }
+            } catch (UnsatisfiedLinkError e) { hide = false; }
+            boolean redraw = false;
+            if (!hwHiddenApplied && ForestActivity.hasHwPad()) {
+                hwHiddenApplied = true;
+                if (shown) { shown = false; release(); redraw = true; }
+            }
             if (hide != autoHidden) {
                 autoHidden = hide;
                 if (hide) release();
-                invalidate();
+                redraw = true;
             }
-            postDelayed(this, 250);
+            if (nx != vcx || ny != vcy) {
+                vcx = nx; vcy = ny;
+                redraw = true;
+            }
+            if (redraw) invalidate();
+            postDelayed(this, (nx >= 0f) ? 33 : 200);
         }
     };
     @Override protected void onAttachedToWindow() { super.onAttachedToWindow(); post(cursorPoll); }
@@ -92,6 +109,15 @@ public class PadView extends View {
         cv.drawRoundRect(toggle, 12, 12, fill);
         cv.drawRoundRect(toggle, 12, 12, stroke);
         cv.drawText(shown ? "Pad ✕" : "Pad", toggle.centerX(), toggle.centerY() + text.getTextSize() / 3, text);
+        if (vcx >= 0f && vcy >= 0f) {
+            float px = vcx * getWidth(), py = vcy * getHeight();
+            float r = Math.max(12f, Math.min(getWidth(), getHeight()) * 0.014f);
+            fill.setColor(Color.argb(190, 255, 224, 64));
+            cv.drawCircle(px, py, r * 0.45f, fill);
+            fill.setColor(Color.argb(80, 0, 0, 0));
+            cv.drawCircle(px, py, r, fill);
+            cv.drawCircle(px, py, r, stroke);
+        }
         if (!active()) return;
         fill.setColor(Color.argb(60, 255, 255, 255));
         cv.drawCircle(stickCx, stickCy, stickR, fill);

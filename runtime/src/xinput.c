@@ -54,6 +54,15 @@ void w64_xinput_set(int idx, int connected, uint16_t buttons, uint8_t lt, uint8_
     pthread_mutex_unlock(&g_mu);
 }
 
+uint16_t w64_xinput_buttons(int idx)
+{
+    if (idx < 0 || idx > 3) return 0;
+    pthread_mutex_lock(&g_mu);
+    uint16_t b = g_pads[idx].connected ? hold(&g_pads[idx]) : 0;
+    pthread_mutex_unlock(&g_mu);
+    return b;
+}
+
 #define ERROR_DEVICE_NOT_CONNECTED 1167u
 #define ERROR_EMPTY_ 4306u
 

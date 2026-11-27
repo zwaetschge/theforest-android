@@ -278,12 +278,22 @@ static uint64_t open_file(const char *path, uint32_t access, uint32_t disp, uint
     return w64_handle_new(H_FILE, o);
 }
 
+extern uint16_t w64_xinput_buttons(int idx);
+static uint64_t g_hid_buf;
+static uint32_t g_hid_len;
+static uint32_t g_hid_last_btn = 0x10000u;
+
 static void CreateFileW_(CPU *c)
 {
     char *u = w16_to_utf8(AW(0), -1);
     char p[1024];
     if (!strcmp(u, "CONOUT$")) { free(u); RET(STD_OUT); }
     if (!strcmp(u, "CONIN$")) { free(u); RET(STD_IN); }
+    if (strstr(u, "VID_045E&PID_028E&IG_00")) {
+        g_hid_last_btn = 0x10000u;
+        free(u);
+        RET(0x48494401ull);
+    }
     w64_host_path(u, p, sizeof p);
     uint64_t h = open_file(p, AU(1), AU(4), AU(5));
     static int ftrace = -1;
@@ -302,6 +312,12 @@ static void CreateFileA_(CPU *c)
 
 static void ReadFile_(CPU *c)
 {
+    if (A(0) == 0x48494401ull) {
+        g_hid_buf = A(1);
+        g_hid_len = AU(2);
+        w64_set_last_error(997 /* ERROR_IO_PENDING */);
+        RET(0);
+    }
     fobj_t *o = fobj(A(0));
     if (!o) { w64_set_last_error(ERROR_INVALID_HANDLE); RET(0); }
     uint64_t ov = A(4);
@@ -938,7 +954,25 @@ static void LockFileEx_(CPU *c) { RET(1); }
 static void UnlockFileEx_(CPU *c) { RET(1); }
 static void AreFileApisANSI_(CPU *c) { RET(1); }
 static void DeviceIoControl_(CPU *c) { w64_set_last_error(1); RET(0); }
-static void GetOverlappedResult_(CPU *c) { if (A(2)) wr32(A(2), (uint32_t)rd64(A(1) + 8)); RET(1); }
+static void GetOverlappedResult_(CPU *c)
+{
+    if (A(0) == 0x48494401ull) {
+        uint16_t btn = w64_xinput_buttons(0);
+        if ((uint32_t)btn == g_hid_last_btn) {
+            w64_set_last_error(996 /* ERROR_IO_INCOMPLETE */);
+            RET(0);
+        }
+        g_hid_last_btn = btn;
+        if (g_hid_buf && g_hid_len >= 2) {
+            memset((void *)(uintptr_t)g_hid_buf, 0, g_hid_len);
+            wr16(g_hid_buf, btn);
+        }
+        if (A(2)) wr32(A(2), g_hid_len ? g_hid_len : 16);
+        RET(1);
+    }
+    if (A(2)) wr32(A(2), (uint32_t)rd64(A(1) + 8));
+    RET(1);
+}
 static void CancelIo_(CPU *c) { RET(1); }
 
 /* CopyFileW(src, dst, failIfExists) -> CopyFileExW semantics */

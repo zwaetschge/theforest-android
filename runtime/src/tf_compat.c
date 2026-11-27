@@ -420,6 +420,90 @@ static void ovrp_GetControllerState4_(CPU *c) { RET(-1004 /* ovrpFailure_NotInit
 static void ovrp_GetControllerState_sret_(CPU *c) { RET(A(0)); /* zeroed sret_buf from mono_tramp_dispatch */ }
 static void DirectInput8Create_(CPU *c) { RET(0x80004005u /* E_FAIL */); }
 
+/* Minimal HID stubs for Unity 5.6's RawInput::OpenJoystick() so it recognizes our virtual
+ * XInput HID pad (HDEV_PAD / 0x48494401) via "IG_00" and polls XInputGetState(0) for
+ * UnityEngine.Input.GetKeyDown(KeyCode.JoystickButton0/1) in NGUI menus. */
+static void HidD_GetPreparsedData_(CPU *c)
+{
+    if (A(0) == 0x48494401ull && A(1)) { wr64(A(1), 0x48494410ull); RET(1); }
+    RET(0);
+}
+static void HidD_GetProductString_(CPU *c)
+{
+    if (A(0) == 0x48494401ull && A(1) && AU(2) >= 2) {
+        const char *name = "Controller (XBOX 360 For Windows)";
+        int maxc = (int)(AU(2) / 2);
+        utf8_to_w16(name, (uint16_t *)AP(1), maxc);
+        RET(1);
+    }
+    RET(0);
+}
+static void HidP_GetCaps_(CPU *c)
+{
+    if (A(0) == 0x48494410ull && A(1)) {
+        memset(AP(1), 0, 64);
+        wr16(A(1) + 0, 5);   /* Usage = HID_USAGE_GENERIC_GAMEPAD */
+        wr16(A(1) + 2, 1);   /* UsagePage = HID_USAGE_PAGE_GENERIC */
+        wr16(A(1) + 4, 16);  /* InputReportByteLength */
+        wr16(A(1) + 46, 1);  /* NumberInputButtonCaps */
+        wr16(A(1) + 50, 10); /* NumberInputDataIndices */
+        RET(0x110000u);      /* HIDP_STATUS_SUCCESS */
+    }
+    RET(0xC0110001u);
+}
+static void HidP_GetButtonCaps_(CPU *c)
+{
+    /* HidP_GetButtonCaps(ReportType=0, ButtonCaps, &ButtonCapsLength, PreparsedData) */
+    if (AU(0) == 0 && A(1) && A(2) && A(3) == 0x48494410ull && rd16(A(2)) >= 1) {
+        memset(AP(1), 0, 72);
+        wr16(A(1) + 0, 9);   /* UsagePage = HID_USAGE_PAGE_BUTTON */
+        wr8(A(1) + 12, 1);   /* IsRange = TRUE */
+        wr16(A(1) + 56, 1);  /* Range.UsageMin = 1 (A) */
+        wr16(A(1) + 58, 10); /* Range.UsageMax = 10 (RS) */
+        wr16(A(1) + 68, 0);  /* Range.DataIndexMin = 0 */
+        wr16(A(1) + 70, 9);  /* Range.DataIndexMax = 9 */
+        wr16(A(2), 1);
+        RET(0x110000u);      /* HIDP_STATUS_SUCCESS */
+    }
+    RET(0xC0110001u);
+}
+static void HidP_GetData_(CPU *c)
+{
+    /* HidP_GetData(ReportType=0, DataList, &DataLength, PreparsedData, Report, ReportLength) */
+    static const uint16_t k_xbtn[10] = {
+        0x1000, /* 0: A */
+        0x2000, /* 1: B */
+        0x4000, /* 2: X */
+        0x8000, /* 3: Y */
+        0x0100, /* 4: LB */
+        0x0200, /* 5: RB */
+        0x0020, /* 6: Back */
+        0x0010, /* 7: Start */
+        0x0040, /* 8: LS */
+        0x0080, /* 9: RS */
+    };
+    if (AU(0) == 0 && A(1) && A(2) && A(3) == 0x48494410ull && A(4) && AU(5) >= 2) {
+        uint32_t cap = rd32(A(2)), n = 0;
+        uint16_t btn = rd16(A(4));
+        for (uint16_t i = 0; i < 10 && n < cap; i++) {
+            if (btn & k_xbtn[i]) {
+                uint64_t p = A(1) + (uint64_t)n * 8u;
+                wr16(p + 0, i);
+                wr16(p + 2, 0);
+                wr32(p + 4, 1);
+                n++;
+            }
+        }
+        wr32(A(2), n);
+        RET(0x110000u);
+    }
+    RET(0xC0110001u);
+}
+static void HidP_MaxDataListLength_(CPU *c)
+{
+    RET(A(1) == 0x48494410ull ? 16u : 0u);
+}
+
 static const w64_export_t tf_compat_exports[] = {
     /* KERNEL32 */
     { "kernel32.dll", "GetVersion", GetVersion_ },
@@ -602,17 +686,17 @@ static const w64_export_t tf_compat_exports[] = {
     { "opengl32.dll", "wglGetCurrentDC", stub_ret0_ },
     { "opengl32.dll", "wglGetProcAddress", stub_ret0_ },
     { "opengl32.dll", "wglMakeCurrent", stub_ret0_ },
-    { "hid.dll", "HidD_GetPreparsedData", stub_ret0_ },
+    { "hid.dll", "HidD_GetPreparsedData", HidD_GetPreparsedData_ },
     { "hid.dll", "HidD_FreePreparsedData", stub_ret1_ },
     { "hid.dll", "HidD_GetIndexedString", stub_ret0_ },
     { "hid.dll", "HidD_GetManufacturerString", stub_ret0_ },
-    { "hid.dll", "HidD_GetProductString", stub_ret0_ },
+    { "hid.dll", "HidD_GetProductString", HidD_GetProductString_ },
     { "hid.dll", "HidD_GetSerialNumberString", stub_ret0_ },
-    { "hid.dll", "HidP_GetCaps", stub_ret0_ },
-    { "hid.dll", "HidP_GetButtonCaps", stub_ret0_ },
+    { "hid.dll", "HidP_GetCaps", HidP_GetCaps_ },
+    { "hid.dll", "HidP_GetButtonCaps", HidP_GetButtonCaps_ },
     { "hid.dll", "HidP_GetValueCaps", stub_ret0_ },
-    { "hid.dll", "HidP_GetData", stub_ret0_ },
-    { "hid.dll", "HidP_MaxDataListLength", stub_ret0_ },
+    { "hid.dll", "HidP_GetData", HidP_GetData_ },
+    { "hid.dll", "HidP_MaxDataListLength", HidP_MaxDataListLength_ },
     { 0 }
 };
 

@@ -117,10 +117,37 @@ int w64_audio_sink_open(int rate, int channels)
 void w64_audio_sink_write(const float *frames, int n) { if (g_astream) SDL_PutAudioStreamData(g_astream, frames, n * g_ach * (int)sizeof(float)); }
 int w64_audio_sink_queued(void) { return g_astream ? SDL_GetAudioStreamQueued(g_astream) / (g_ach * (int)sizeof(float)) : 0; }
 
-/* ---- gamepads -> XInput pad 0 ---- */
-static SDL_Gamepad *g_pad;
+/* ---- gamepads -> XInput pad 0 (+ virtual menu cursor on Title Screen & Menus) ---- */
+#define MAX_HW_PADS 8
+static SDL_Gamepad *g_pads[MAX_HW_PADS];
 static struct { uint16_t buttons; uint8_t lt, rt; int16_t lx, ly, rx, ry; } g_hw, g_vpad;
 static pthread_mutex_t g_pad_mu = PTHREAD_MUTEX_INITIALIZER;
+static int g_sw, g_sh;
+static int g_vcursor_vis;
+static float g_vcx, g_vcy;
+static int g_in_gameplay;
+static uint64_t g_hidden_since_ns;
+
+void w64_user32_click(int x, int y);
+void w64_user32_get_mouse_pos(int *x, int *y);
+int w64_user32_cursor_shown(void);
+
+static void *tap_thread(void *arg)
+{
+    intptr_t v = (intptr_t)arg;
+    w64_user32_click((int)(v >> 16), (int)(v & 0xFFFF));
+    return NULL;
+}
+static void spawn_click(int x, int y)
+{
+    pthread_t th;
+    intptr_t v = ((intptr_t)(x & 0xFFFF) << 16) | ((intptr_t)(y & 0xFFFF));
+    if (pthread_create(&th, NULL, tap_thread, (void *)v) == 0) pthread_detach(th);
+}
+static int16_t deadzone(int16_t v)
+{
+    return (v > -2500 && v < 2500) ? 0 : v;
+}
 static void pad_publish(void)
 {
     pthread_mutex_lock(&g_pad_mu);
@@ -144,30 +171,127 @@ static uint16_t xbutton(int b)
     return 0;
 }
 static int16_t inv(int16_t v) { return v == -32768 ? 32767 : (int16_t)-v; }
+static int g_pad_log_cnt;
+static int g_java_hwpad_active;
+static uint16_t g_prev_hw_buttons;
+static void vcursor_init_pos(void)
+{
+    if (!g_vcursor_vis && g_sw > 0 && g_sh > 0) {
+        int mx = 0, my = 0;
+        w64_user32_get_mouse_pos(&mx, &my);
+        if (mx <= 2 && my <= 2) {
+            /* Default right on SINGLE PLAYER for instant handheld navigation */
+            g_vcx = g_sw * 0.16f;
+            g_vcy = g_sh * 0.45f;
+        } else {
+            g_vcx = (float)mx;
+            g_vcy = (float)my;
+        }
+        g_vcursor_vis = 1;
+        int ix = (int)g_vcx, iy = (int)g_vcy;
+        w64_user32_mouse_pos(ix, iy);
+        w64_user32_post_input(0x0200, 0, (uint64_t)(uint16_t)ix | ((uint64_t)(uint16_t)iy << 16));
+    }
+}
+static void vcursor_tick(float dt)
+{
+    int shown = w64_user32_cursor_shown();
+    uint64_t now = w64_now_ns();
+    if (!shown) {
+        g_vcursor_vis = 0;
+        if (!g_hidden_since_ns) g_hidden_since_ns = now;
+        else if (now - g_hidden_since_ns > 1500000000ull) g_in_gameplay = 1;
+        return;
+    }
+    g_hidden_since_ns = 0;
+    if (g_sw <= 0 || g_sh <= 0) return;
+
+    /* In any menu (Title Screen, Options, Pause): Right Stick moves an optional visible mouse cursor
+     * (useful for Options sliders & Title Screen) without interfering with native Left-Stick / D-Pad / A
+     * XInput navigation! Moving Left Stick or pressing D-Pad hides the virtual cursor so native XInput A works. */
+    pthread_mutex_lock(&g_pad_mu);
+    int16_t rx = g_hw.rx, ry = g_hw.ry, lx = g_hw.lx, ly = g_hw.ly;
+    uint16_t btns = g_hw.buttons;
+    pthread_mutex_unlock(&g_pad_mu);
+
+    float dx = 0.0f, dy = 0.0f;
+    if (rx || ry) {
+        dx = (float)rx / 32767.0f;
+        dy = -(float)ry / 32767.0f;
+    } else {
+        if (lx || ly || (btns & 0x0Fu)) g_vcursor_vis = 0;
+        return;
+    }
+    vcursor_init_pos();
+    float speed = (float)g_sw * 0.55f;
+    g_vcx += dx * speed * dt;
+    g_vcy += dy * speed * dt;
+    if (g_vcx < 0.0f) g_vcx = 0.0f;
+    if (g_vcx > (float)(g_sw - 1)) g_vcx = (float)(g_sw - 1);
+    if (g_vcy < 0.0f) g_vcy = 0.0f;
+    if (g_vcy > (float)(g_sh - 1)) g_vcy = (float)(g_sh - 1);
+    int ix = (int)g_vcx, iy = (int)g_vcy;
+    w64_user32_mouse_pos(ix, iy);
+    w64_user32_raw_mouse(dx > 0.0f ? 1 : (dx < 0.0f ? -1 : 0), dy > 0.0f ? 1 : (dy < 0.0f ? -1 : 0), 0, 0);
+    w64_user32_post_input(0x0200, 0, (uint64_t)(uint16_t)ix | ((uint64_t)(uint16_t)iy << 16));
+}
 static void gamepad_event(const SDL_Event *e)
 {
+    if (g_java_hwpad_active) return;
     switch (e->type) {
-    case SDL_EVENT_GAMEPAD_ADDED:
-        if (!g_pad) { g_pad = SDL_OpenGamepad(e->gdevice.which); w64_log("[android] gamepad %s", g_pad ? SDL_GetGamepadName(g_pad) : "?"); }
+    case SDL_EVENT_GAMEPAD_ADDED: {
+        SDL_Gamepad *p = SDL_OpenGamepad(e->gdevice.which);
+        if (p) {
+            int stored = 0;
+            for (int i = 0; i < MAX_HW_PADS; i++) {
+                if (!g_pads[i]) { g_pads[i] = p; stored = 1; break; }
+            }
+            w64_log("[android] gamepad %s (id=%u%s)", SDL_GetGamepadName(p) ? SDL_GetGamepadName(p) : "?",
+                    (unsigned)e->gdevice.which, stored ? "" : ", pool full");
+            if (!stored) SDL_CloseGamepad(p);
+        }
         break;
+    }
     case SDL_EVENT_GAMEPAD_REMOVED:
-        if (g_pad && SDL_GetGamepadID(g_pad) == e->gdevice.which) { SDL_CloseGamepad(g_pad); g_pad = NULL; memset(&g_hw, 0, sizeof g_hw); }
+        for (int i = 0; i < MAX_HW_PADS; i++) {
+            if (g_pads[i] && SDL_GetGamepadID(g_pads[i]) == e->gdevice.which) {
+                SDL_CloseGamepad(g_pads[i]);
+                g_pads[i] = NULL;
+                pthread_mutex_lock(&g_pad_mu);
+                memset(&g_hw, 0, sizeof g_hw);
+                pthread_mutex_unlock(&g_pad_mu);
+                break;
+            }
+        }
         break;
     case SDL_EVENT_GAMEPAD_BUTTON_DOWN: case SDL_EVENT_GAMEPAD_BUTTON_UP: {
         uint16_t m = xbutton(e->gbutton.button);
+        if (g_pad_log_cnt < 10 && e->gbutton.down) {
+            g_pad_log_cnt++;
+            w64_log("[android] sdl-pad btn=%d mask=%#x cursor=%d in_game=%d vcur=%d",
+                    (int)e->gbutton.button, (unsigned)m, w64_user32_cursor_shown(), g_in_gameplay, g_vcursor_vis);
+        }
+        if (w64_user32_cursor_shown() && g_vcursor_vis && e->gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH) {
+            if (e->gbutton.down) spawn_click((int)g_vcx, (int)g_vcy);
+            return;
+        }
+        pthread_mutex_lock(&g_pad_mu);
         if (e->gbutton.down) g_hw.buttons |= m; else g_hw.buttons &= (uint16_t)~m;
+        pthread_mutex_unlock(&g_pad_mu);
         break;
     }
     case SDL_EVENT_GAMEPAD_AXIS_MOTION: {
         int16_t v = e->gaxis.value;
+        pthread_mutex_lock(&g_pad_mu);
         switch (e->gaxis.axis) {
-        case SDL_GAMEPAD_AXIS_LEFTX: g_hw.lx = v; break;
-        case SDL_GAMEPAD_AXIS_LEFTY: g_hw.ly = inv(v); break;
-        case SDL_GAMEPAD_AXIS_RIGHTX: g_hw.rx = v; break;
-        case SDL_GAMEPAD_AXIS_RIGHTY: g_hw.ry = inv(v); break;
-        case SDL_GAMEPAD_AXIS_LEFT_TRIGGER: g_hw.lt = (uint8_t)(v > 0 ? v >> 7 : 0); break;
-        case SDL_GAMEPAD_AXIS_RIGHT_TRIGGER: g_hw.rt = (uint8_t)(v > 0 ? v >> 7 : 0); break;
+        case SDL_GAMEPAD_AXIS_LEFTX: g_hw.lx = deadzone(v); break;
+        case SDL_GAMEPAD_AXIS_LEFTY: g_hw.ly = deadzone(inv(v)); break;
+        case SDL_GAMEPAD_AXIS_RIGHTX: g_hw.rx = deadzone(v); break;
+        case SDL_GAMEPAD_AXIS_RIGHTY: g_hw.ry = deadzone(inv(v)); break;
+        case SDL_GAMEPAD_AXIS_LEFT_TRIGGER: g_hw.lt = (uint8_t)(v > 1000 ? v >> 7 : 0); break;
+        case SDL_GAMEPAD_AXIS_RIGHT_TRIGGER: g_hw.rt = (uint8_t)(v > 1000 ? v >> 7 : 0); break;
         }
+        pthread_mutex_unlock(&g_pad_mu);
         break;
     }
     default: return;
@@ -175,9 +299,32 @@ static void gamepad_event(const SDL_Event *e)
     pad_publish();
 }
 
-/* ---- on-screen pad (PadView.java) ---- */
+/* ---- on-screen pad (PadView.java) & direct Android hardware gamepad (ForestActivity.java) ---- */
 #include <jni.h>
-void w64_user32_click(int x, int y);
+JNIEXPORT void JNICALL Java_ch_plum_theforest_ForestActivity_nativeSetHwPad(JNIEnv *env, jclass cls, jint buttons, jint lt, jint rt,
+                                                                            jint lx, jint ly, jint rx, jint ry)
+{
+    (void)env; (void)cls;
+    g_java_hwpad_active = 1;
+    uint16_t b = (uint16_t)buttons;
+    uint16_t newly_pressed = (uint16_t)(b & ~g_prev_hw_buttons);
+    g_prev_hw_buttons = b;
+    int shown = w64_user32_cursor_shown();
+    if (g_pad_log_cnt < 15 && (newly_pressed || (g_pad_log_cnt < 3 && (lx || ly || rx || ry || lt || rt)))) {
+        g_pad_log_cnt++;
+        w64_log("[android] hwpad btn=%#x lt=%d rt=%d L=(%d,%d) R=(%d,%d) cur=%d vcur=%d",
+                (unsigned)b, (int)lt, (int)rt, (int)lx, (int)ly, (int)rx, (int)ry, shown, g_vcursor_vis);
+    }
+    if (shown && g_vcursor_vis && (b & 0x1000u)) {
+        if (newly_pressed & 0x1000u) spawn_click((int)g_vcx, (int)g_vcy);
+        b &= (uint16_t)~0x1000u;
+    }
+    pthread_mutex_lock(&g_pad_mu);
+    g_hw.buttons = b; g_hw.lt = (uint8_t)lt; g_hw.rt = (uint8_t)rt;
+    g_hw.lx = (int16_t)lx; g_hw.ly = (int16_t)ly; g_hw.rx = (int16_t)rx; g_hw.ry = (int16_t)ry;
+    pthread_mutex_unlock(&g_pad_mu);
+    pad_publish();
+}
 JNIEXPORT void JNICALL Java_ch_plum_theforest_ForestActivity_nativeSetPad(JNIEnv *env, jclass cls, jint buttons, jint lt, jint rt,
                                                                           jint lx, jint ly, jint rx, jint ry)
 {
@@ -188,7 +335,6 @@ JNIEXPORT void JNICALL Java_ch_plum_theforest_ForestActivity_nativeSetPad(JNIEnv
     pthread_mutex_unlock(&g_pad_mu);
     pad_publish();
 }
-static int g_sw, g_sh;
 JNIEXPORT void JNICALL Java_ch_plum_theforest_ForestActivity_nativeLook(JNIEnv *env, jclass cls, jfloat dx, jfloat dy)
 {
     (void)env; (void)cls;
@@ -198,24 +344,25 @@ JNIEXPORT void JNICALL Java_ch_plum_theforest_ForestActivity_nativeLook(JNIEnv *
     rx -= (float)ix; ry -= (float)iy;
     if (ix || iy) w64_user32_raw_mouse(ix, iy, 0, 0);
 }
-int w64_user32_cursor_shown(void);
 JNIEXPORT jboolean JNICALL Java_ch_plum_theforest_ForestActivity_nativeCursorShown(JNIEnv *env, jclass cls)
 {
     (void)env; (void)cls;
     return w64_user32_cursor_shown() ? JNI_TRUE : JNI_FALSE;
 }
-static void *tap_thread(void *arg)
+JNIEXPORT jfloat JNICALL Java_ch_plum_theforest_ForestActivity_nativeVCursorX(JNIEnv *env, jclass cls)
 {
-    intptr_t v = (intptr_t)arg;
-    w64_user32_click((int)(v >> 16), (int)(v & 0xFFFF));
-    return NULL;
+    (void)env; (void)cls;
+    return (g_vcursor_vis && g_sw > 0) ? (g_vcx / (float)g_sw) : -1.0f;
+}
+JNIEXPORT jfloat JNICALL Java_ch_plum_theforest_ForestActivity_nativeVCursorY(JNIEnv *env, jclass cls)
+{
+    (void)env; (void)cls;
+    return (g_vcursor_vis && g_sh > 0) ? (g_vcy / (float)g_sh) : -1.0f;
 }
 JNIEXPORT void JNICALL Java_ch_plum_theforest_ForestActivity_nativeTap(JNIEnv *env, jclass cls, jfloat x, jfloat y)
 {
     (void)env; (void)cls;
-    pthread_t th;
-    intptr_t v = ((intptr_t)(x * g_sw) << 16) | ((intptr_t)(y * g_sh) & 0xFFFF);
-    if (pthread_create(&th, NULL, tap_thread, (void *)v) == 0) pthread_detach(th);
+    spawn_click((int)(x * g_sw), (int)(y * g_sh));
 }
 
 /* ---- touch -> mouse ---- */
@@ -223,22 +370,46 @@ JNIEXPORT void JNICALL Java_ch_plum_theforest_ForestActivity_nativeTap(JNIEnv *e
 #define WM_LBUTTONDOWN 0x0201
 #define WM_LBUTTONUP   0x0202
 static SDL_FingerID g_finger;
-static int g_finger_down, g_lx, g_ly;
+static int g_finger_down, g_lx, g_ly, g_down_x, g_down_y, g_menu_touch, g_menu_drag;
 static unsigned long g_down_frame;
 static uint64_t mlp(int x, int y) { return (uint64_t)(uint16_t)x | ((uint64_t)(uint16_t)y << 16); }
+static int g_touch_log_cnt;
 static void touch(const SDL_TouchFingerEvent *f, int kind)
 {
     int x = (int)(f->x * g_sw), y = (int)(f->y * g_sh);
     if (kind == SDL_EVENT_FINGER_DOWN) {
         if (g_finger_down) return;
         g_finger = f->fingerID; g_finger_down = 1;
-        w64_user32_mouse_pos(x, y);
-        w64_user32_post_input(WM_MOUSEMOVE, 0, mlp(x, y));
-        w64_user32_raw_mouse(x - g_lx, y - g_ly, 0, 0);
+        g_down_x = x; g_down_y = y; g_menu_drag = 0;
+        g_vcursor_vis = 0;
+        g_menu_touch = w64_user32_cursor_shown();
+        if (g_menu_touch) {
+            /* NGUI UICamera.ProcessMouse() ignores clicks in Controller scheme if mouse delta == 0,
+             * and cancels OnClick if delta > clickThreshold on the press frame. Settle hover for 1 frame first! */
+            if (x == g_lx && y == g_ly) {
+                int nx = x > 0 ? x - 1 : x + 1;
+                w64_user32_mouse_pos(nx, y);
+                w64_user32_raw_mouse(nx - x, 0, 0, 0);
+                w64_user32_post_input(WM_MOUSEMOVE, 0, mlp(nx, y));
+                w64_user32_hold_frames(1);
+            }
+            w64_user32_mouse_pos(x, y);
+            w64_user32_raw_mouse(x != g_lx ? (x - g_lx) : 1, y - g_ly, 0, 0);
+            w64_user32_post_input(WM_MOUSEMOVE, 0, mlp(x, y));
+            w64_user32_hold_frames(1);
+        } else {
+            w64_user32_mouse_pos(x, y);
+            w64_user32_post_input(WM_MOUSEMOVE, 0, mlp(x, y));
+            w64_user32_raw_mouse(x - g_lx, y - g_ly, 0, 0);
+        }
         w64_user32_key_state(1 /* VK_LBUTTON */, 1);
         w64_user32_raw_mouse(0, 0, 0x0001 /* RI_MOUSE_LEFT_BUTTON_DOWN */, 0);
         w64_user32_post_input(WM_LBUTTONDOWN, 1, mlp(x, y));
         g_down_frame = hp_present_count();
+        if (g_touch_log_cnt < 10) {
+            g_touch_log_cnt++;
+            w64_log("[android] touch down (%d,%d) menu=%d f=%lu", x, y, g_menu_touch, g_down_frame);
+        }
     } else if (f->fingerID == g_finger && g_finger_down) {
         w64_user32_mouse_pos(x, y);
         if (kind == SDL_EVENT_FINGER_MOTION) {
@@ -250,6 +421,10 @@ static void touch(const SDL_TouchFingerEvent *f, int kind)
             w64_user32_key_state(1, 0);
             w64_user32_raw_mouse(0, 0, 0x0002 /* RI_MOUSE_LEFT_BUTTON_UP */, 0);
             w64_user32_post_input(WM_LBUTTONUP, 0, mlp(x, y));
+            if (g_touch_log_cnt < 10) {
+                g_touch_log_cnt++;
+                w64_log("[android] touch up (%d,%d) f=%lu", x, y, hp_present_count());
+            }
         }
     } else return;
     g_lx = x; g_ly = y;
@@ -342,9 +517,16 @@ __attribute__((visibility("default"))) int SDL_main(int argc, char *argv[])
     pthread_t th;
     if (pthread_create(&th, &at, game_thread, NULL)) { w64_log("[android] pthread_create failed"); return 1; }
 
+    uint64_t last_tick = w64_now_ns();
     for (;;) {
         SDL_Event e;
-        if (!SDL_WaitEventTimeout(&e, 200)) continue;
+        int wait_ms = w64_user32_cursor_shown() ? 16 : 100;
+        int got = SDL_WaitEventTimeout(&e, wait_ms);
+        uint64_t now = w64_now_ns();
+        float dt = (float)(now - last_tick) * 1e-9f;
+        if (dt > 0.05f) dt = 0.05f;
+        if (dt >= 0.012f) { last_tick = now; vcursor_tick(dt); }
+        if (!got) continue;
         switch (e.type) {
         case SDL_EVENT_FINGER_DOWN: case SDL_EVENT_FINGER_MOTION: case SDL_EVENT_FINGER_UP:
             touch(&e.tfinger, e.type);

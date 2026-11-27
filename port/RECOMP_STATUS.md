@@ -30,16 +30,17 @@ Compiling **614.5 of 619 units (99.3%)** at `-O2 -march=armv8.2-a` shrinks `libm
 - **Native ARM64 Unity Mono (`unity-5.6-mbe`)**: Cross-compiled static ARM64 Mono 4.8 runtime with Boehm GC (`tools/build_mono_android.sh`, `tools/patches/mono-unity56-android.patch`) bridged to the lifted Unity 5.6 player via `runtime/src/mono_bridge.c` and ARM64 Win64-ABI trampolines (`runtime/src/mono_tramp.S`). Includes a patched open-source `mscorlib.dll` (`System.Threading.Thread.Start(object)` compatibility with `AstarPath` / `mutantController` worker threads), bundled in `assets/mono_bcl/`.
 - **Direct3D 11 → Vulkan 1.1**: `gfx/hp_d3d11.cpp` bridges lifted Win64 COM calls into **DXVK Native 1.9.2b** (`gfx/dxvk/prepare.py`, `gfx/dxvk/shaders.py`) with Android WSI, `dxvk-async` (2 compiler threads), and persistent Adreno `VkPipelineCache` (`vk_pipeline.cache`) + `app_process64.dxvk-cache`.
 - **Audio (FMOD Studio + WASAPI → SDL3)**: Lifted `fmod.dll` and `fmodstudio.dll` output through our Win32 WASAPI `IAudioClient` / `IAudioRenderClient` implementation (`runtime/src/wasapi.c`) directly to an SDL3 48 kHz stereo stream (`0 of 1000 blocks short`).
-- **Input & Android Shell**: Physical controllers map to XInput slot 0 (`runtime/src/xinput.c`); `PadView.java` provides a toggleable on-screen gamepad plus right-half touch-look and menu tap-to-click. `Launcher.java` / `GameImporter.java` support SAF folder import, manual ZIP/ZIP64 import, and automatic Plum Hub ZIP64 unpacking from `Android/obb/ch.plum.theforest/`.
+- **Input & Android Shell**: Direct Android hardware gamepad driver (`ForestActivity.java` → `nativeSetHwPad` → `runtime/src/xinput.c`) plus virtual XInput RawInput/HID device (`VID_045E&PID_028E&IG_00` across `user32.c`, `k32_file.c`, `tf_compat.c`) so both Rewired gameplay controls and Unity 5.6 NGUI menu buttons (`KeyCode.JoystickButton0..9`) work natively without touch. `PadView.java` auto-hides when a physical controller is present and remains toggleable via the top-right `Pad` button. `Launcher.java` / `GameImporter.java` support SAF folder import, manual ZIP/ZIP64 import, and automatic Plum Hub ZIP64 unpacking from `Android/obb/ch.plum.theforest/`.
 - **Offline Steamworks Stub**: `runtime/src/steam.c` stubs `CSteamworks` / `SteamAPI` for full offline singleplayer operation.
 
-## Hardware Verification — Samsung Galaxy Tab S8 Ultra (`Adreno 730`, Snapdragon 8 Gen 1, `0.2.0`)
+## Hardware Verification — Samsung Galaxy Tab S8 Ultra (`Adreno 730`, Snapdragon 8 Gen 1, `0.2.0` / `0.2.1`)
 
-Measured on signed release APK `out/TheForest-Android-0.2.0.apk` (`64 MB`, SHA-256 `f8a3e089a81a4e35ee95a31187055b193f65e921c0ca2a0ce0437f5bd06293d7`) with `HP_STUTTER=1;HP_SYNC_INTERVAL=0` at default `1280×800` render resolution and default `W64_NCPU=4`:
+Measured on signed release APKs `out/TheForest-Android-0.2.0.apk` and `out/TheForest-Android-0.2.1.apk` (`64 MB`, `0.2.1` SHA-256 `5fe13808814f40acf7e7377269af142bc1984ec8275d341a7e751d4cdc50bb91`) with `HP_STUTTER=1;HP_SYNC_INTERVAL=0` at default `1280×800` render resolution and default `W64_NCPU=4`:
 
 | Check | Result |
 |---|---|
-| **In-Place Upgrade (`0.1.0 → 0.2.0`)** | `pm install -r` succeeded cleanly with matching `work/release.keystore` signature |
+| **In-Place Upgrade (`0.1.0 → 0.2.0 → 0.2.1`)** | `pm install -r` succeeded cleanly with matching `work/release.keystore` signature |
+| **Controller-Only NGUI Menus & Gameplay (`0.2.1`)** | End-to-end zero-touch flow verified: Title Screen → `SINGLE PLAYER (A)` → `NEW GAME (A)` → `B` (`BACK`) → `SINGLE PLAYER (A)` → `NEW GAME (A)` → `NORMAL (A)` → `ForestMain_v08` → `Y` crash-intro skip → `Start` Pause menu → `CONTINUE (A)` resume; `PadView` auto-hidden; `0 of 1000 blocks short` audio |
 | **Auto-Seeded Crisp Mobile Preset** | `QualityPreset.ensureDefault()` seeded 35 Unity `PlayerPrefs` keys (`FullRes` textures + `FXAA` + mobile shadows/physics) into `registry.dat` |
 | **Title Screen (3D Cave + Menu)** | **60.4 fps**, `p50 = 16.5–16.7 ms`, `p95 = 18.9–19.8 ms`, `0` frames ≥ 30 ms steady-state, `gp = 0(0ms)` |
 | **New Game → `ForestMain_v08` Load** | `Load ForestMain_v08: 14.42 s`, `Activation: 7.93 s`, **`0` Astar/Mono/ItemDatabase exceptions** |

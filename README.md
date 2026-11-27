@@ -20,7 +20,7 @@ A native Android (`arm64-v8a`) port of the PC version of **The Forest** (Unity 5
 
 ## Status
 
-Playable singleplayer (`0.2.0`). Verified on real Android hardware (**AYN Odin 3** and **Samsung Galaxy Tab S8 Ultra**): boot, 3D cave title screen, NGUI menus, new game creation, `ForestMain_v08` open-world loading (`0` Mono/Astar/ItemDatabase exceptions), plane crash intro & skip, outdoor 3D Forest exploration, FMOD Studio WASAPI → SDL3 stereo audio, physical gamepad + toggleable on-screen `PadView`, automatic ZIP64 data-pack unpacking, automatic first-run crisp mobile graphics preset (`FullRes` textures + `FXAA`), and background/resume lifecycle (same PID, persistent Adreno `VkPipelineCache`). Technical log: [`port/RECOMP_STATUS.md`](port/RECOMP_STATUS.md).
+Playable singleplayer (`0.2.1`). Verified on real Android hardware (**AYN Odin 3** and **Samsung Galaxy Tab S8 Ultra**): boot, 3D cave title screen, full controller-only NGUI menu navigation (`A`/`B`/`Y`/`Start`, sticks, D-Pad), new game creation, `ForestMain_v08` open-world loading (`0` Mono/Astar/ItemDatabase exceptions), plane crash intro & skip, outdoor 3D Forest exploration, FMOD Studio WASAPI → SDL3 stereo audio, direct Android physical gamepad driver + auto-hiding toggleable on-screen `PadView`, automatic ZIP64 data-pack unpacking, automatic first-run crisp mobile graphics preset (`FullRes` textures + `FXAA`), and background/resume lifecycle (same PID, persistent Adreno `VkPipelineCache`). Technical log: [`port/RECOMP_STATUS.md`](port/RECOMP_STATUS.md).
 
 | Device | GPU | Resolution | Title Screen | Open-World Forest (`0.2.0`) | Memory (PSS) |
 |---|---|---|---|---|---|
@@ -48,7 +48,7 @@ cd theforest-android
 ./build.sh "/path/to/The Forest"
 ```
 
-Output: `out/TheForest-Android-0.2.0.apk` (~64 MB).
+Output: `out/TheForest-Android-0.2.1.apk` (~64 MB).
 
 What `./build.sh` does (inside Docker via `docker/Dockerfile` and `tools/build.sh`):
 
@@ -58,13 +58,13 @@ What `./build.sh` does (inside Docker via `docker/Dockerfile` and `tools/build.s
 4. Prepares DXVK Native D3D11 for Android (`gfx/dxvk/prepare.py`) and compiles its built-in Vulkan 1.1 shaders (`gfx/dxvk/shaders.py`).
 5. Cross-compiles Unity Mono 4.8 (Boehm GC) for `arm64-v8a` (`tools/build_mono_android.sh`) and builds the 13 open-source Mono 4.8 BCL DLLs (`tools/build_mono_bcl.sh`) bundled in `assets/mono_bcl/`.
 6. Compiles `libmain.so` (**614.5/619 units = 99.3%** at `-O2 -march=armv8.2-a`, only 4.5 units at `-O0` per `config/o0_host.txt` + `0018` cold-tail pragma) + `libSDL3.so` for `arm64-v8a` using Android NDK `27.3.13750724`.
-7. Builds and signs `out/TheForest-Android-0.2.0.apk` with Gradle (auto-generates a reusable keystore in `work/release.keystore`, or uses `TF_KEYSTORE*`).
+7. Builds and signs `out/TheForest-Android-0.2.1.apk` with Gradle (auto-generates a reusable keystore in `work/release.keystore`, or uses `TF_KEYSTORE*`).
 
 Low on RAM? Pass `JOBS=4 ./build.sh ...` to cap parallel compilation jobs. On Linux without Docker, install the packages from `docker/Dockerfile` and run `sh tools/build.sh "/path/to/The Forest"` directly.
 
 ## Install & Play
 
-1. Install the APK: `adb install -r out/TheForest-Android-0.2.0.apk`
+1. Install the APK: `adb install -r out/TheForest-Android-0.2.1.apk`
 2. Import your PC game data (~1.99 GB: `TheForest.exe` and `TheForest_Data/`):
    - Open the app and tap **"Ordner wählen"** to pick your game folder via Android SAF, **or**
    - pack your game folder into a ZIP/ZIP64 archive and pick it via **"Datenpaket (ZIP) wählen"** (or drop it into `Android/obb/ch.plum.theforest/` for automatic unpacking on next launch), **or**
@@ -73,8 +73,8 @@ Low on RAM? Pass `JOBS=4 ./build.sh ...` to cap parallel compilation jobs. On Li
 
 ### Controls & Options
 
-- **Physical Controller** (built-in handheld controls, Bluetooth, USB): mapped directly to XInput slot 0.
-- **On-Screen Pad (`PadView`)**: left stick, `A`/`B`/`X`/`Y`, `LB`/`RB`/`LT`/`RT`, `LS`/`RS`, `Back`/`Start`, right-half swipe for camera look, short tap for menu clicks, and **`Pad ✕`** in the top-right corner to toggle visibility.
+- **Physical Controller** (built-in handheld controls, Bluetooth, USB): direct Android hardware gamepad driver mapped to XInput slot 0 + virtual XInput HID device for Unity 5.6 NGUI menus (`A`/`B`/`Y`/`Start`, sticks, D-Pad, triggers); auto-hides the on-screen pad when detected.
+- **On-Screen Pad (`PadView`)**: left stick, `A`/`B`/`X`/`Y`, `LB`/`RB`/`LT`/`RT`, `LS`/`RS`, `Back`/`Start`, right-half swipe for camera look, short tap for menu clicks, and **`Pad` / `Pad ✕`** in the top-right corner to toggle visibility.
 - **Resolution**: defaults to 1280 px width (`1280×720`, hardware-scaled by Android) for best performance; optional **"Volle Bildschirmauflösung"** toggle in the launcher.
 - **Graphics Preset**: on first launch (or one-time upgrade from `0.1.0`), applies a crisp mobile graphics preset (`FullRes` textures + `FXAA` + mobile-tuned shadows/physics) for 30–60 fps; all settings remain freely adjustable in-game under `OPTIONS → GRAPHICS`, and the launcher includes a one-tap reset button.
 - **Saves, Config & Caches**: stored under `Android/data/ch.plum.theforest/files/user/` (`registry.dat`, `C/Users/Player/...`, `vk_pipeline.cache`, `app_process64.dxvk-cache`, `runtime.log`).
